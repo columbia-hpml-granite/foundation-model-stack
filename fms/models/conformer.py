@@ -127,14 +127,23 @@ class ConformerFeedForward(nn.Module):
         self.mult = mult
         self.dropout = dropout
 
-        # TODO: Implement feed-forward layers
-        # - Layer normalization
-        # - Linear projection: dim → dim * mult
-        # - Activation function (SiLU)
-        # - Dropout
-        # - Linear projection: dim * mult → dim
-        # - Dropout
-        raise NotImplementedError("ConformerFeedForward not yet implemented")
+        # Layer normalization
+        self.norm = nn.LayerNorm(dim)
+
+        # Linear projection: dim → dim * mult
+        self.fc1 = nn.Linear(dim, dim * mult)
+
+        # Activation function
+        self.activation = str_to_activation(activation)
+
+        # Dropout
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Linear projection: dim * mult → dim
+        self.fc2 = nn.Linear(dim * mult, dim)
+
+        # Dropout
+        self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -146,8 +155,14 @@ class ConformerFeedForward(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        # TODO: Implement forward pass
-        raise NotImplementedError("ConformerFeedForward.forward() not yet implemented")
+        # x → LayerNorm → Linear → Activation → Dropout → Linear → Dropout
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        x = self.dropout2(x)
+        return x
 
 
 class ConformerAttention(nn.Module):
@@ -182,14 +197,27 @@ class ConformerAttention(nn.Module):
         self.dim_head = dim_head
         self.inner_dim = num_heads * dim_head
         self.max_pos_emb = max_pos_emb
-        self.dropout = dropout
+        self.dropout_prob = dropout
+        self.scale = dim_head ** -0.5
 
-        # TODO: Implement attention components
-        # - Query, Key, Value projections
-        # - Relative positional embeddings (learnable)
-        # - Output projection
-        # - Dropout layers
-        raise NotImplementedError("ConformerAttention not yet implemented")
+        # Layer normalization
+        self.norm = nn.LayerNorm(dim)
+
+        # Query, Key, Value projections
+        self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
+        self.to_k = nn.Linear(dim, self.inner_dim, bias=False)
+        self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
+
+        # Relative positional embeddings (learnable)
+        # Embedding size: 2*max_pos_emb + 1 (for positions from -max_pos_emb to +max_pos_emb)
+        self.pos_emb = nn.Embedding(2 * max_pos_emb + 1, dim_head)
+
+        # Output projection
+        self.to_out = nn.Linear(self.inner_dim, dim)
+
+        # Dropout layers
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -208,14 +236,50 @@ class ConformerAttention(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        # TODO: Implement forward pass
+        batch, seq_len, _ = x.shape
+
+        # Apply layer normalization
+        x = self.norm(x)
+
         # 1. Project to Q, K, V
+        q = self.to_q(x)  # (batch, seq_len, inner_dim)
+        k = self.to_k(x)  # (batch, seq_len, inner_dim)
+        v = self.to_v(x)  # (batch, seq_len, inner_dim)
+
         # 2. Reshape for multi-head attention
+        q = q.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
+        k = k.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
+        v = v.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
+
         # 3. Compute attention scores with relative positional bias
+        # Standard attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (batch, heads, seq_len, seq_len)
+
+        # Add relative positional bias
+        # Get positional embeddings for the current sequence
+        pos_emb = self.pos_emb(attention_dists[:seq_len, :seq_len])  # (seq_len, seq_len, dim_head)
+
+        # Compute positional bias: Q * pos_emb^T
+        # q shape: (batch, heads, seq_len, dim_head)
+        # pos_emb shape: (seq_len, seq_len, dim_head)
+        # We want: (batch, heads, seq_len, seq_len)
+        pos_bias = torch.einsum('bhid,ijd->bhij', q, pos_emb) * self.scale
+
+        attn_scores = attn_scores + pos_bias
+
         # 4. Apply softmax and dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
         # 5. Apply attention to values
+        out = torch.matmul(attn_weights, v)  # (batch, heads, seq_len, dim_head)
+
         # 6. Reshape and project output
-        raise NotImplementedError("ConformerAttention.forward() not yet implemented")
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.inner_dim)  # (batch, seq_len, inner_dim)
+        out = self.to_out(out)  # (batch, seq_len, dim)
+        out = self.out_dropout(out)
+
+        return out
 
 
 class ConformerConvModule(nn.Module):
@@ -259,16 +323,50 @@ class ConformerConvModule(nn.Module):
         self.expansion_factor = expansion_factor
         self.dropout = dropout
 
-        # TODO: Implement convolution module
-        # - Layer normalization
-        # - Pointwise convolution (expansion): dim → dim * expansion_factor * 2 (for GLU)
-        # - GLU activation
-        # - Depthwise convolution with padding
-        # - Batch normalization
-        # - Activation (SiLU)
-        # - Pointwise convolution (compression): dim * expansion_factor → dim
-        # - Dropout
-        raise NotImplementedError("ConformerConvModule not yet implemented")
+        # Layer normalization
+        self.norm = nn.LayerNorm(dim)
+
+        # Pointwise convolution (expansion): dim → dim * expansion_factor * 2 (for GLU)
+        # We use *2 because GLU splits the channels in half
+        self.pointwise_conv1 = nn.Conv1d(
+            dim,
+            dim * expansion_factor * 2,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+        )
+
+        # GLU activation (applied in forward pass)
+        # GLU splits channels and applies sigmoid gating
+
+        # Depthwise convolution with padding
+        # Padding = (kernel_size - 1) // 2 for 'same' padding
+        self.depthwise_conv = nn.Conv1d(
+            dim * expansion_factor,
+            dim * expansion_factor,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=(kernel_size - 1) // 2,
+            groups=dim * expansion_factor,  # Depthwise: each input channel convolved separately
+        )
+
+        # Batch normalization
+        self.batch_norm = nn.BatchNorm1d(dim * expansion_factor)
+
+        # Activation (SiLU)
+        self.activation = str_to_activation(activation)
+
+        # Pointwise convolution (compression): dim * expansion_factor → dim
+        self.pointwise_conv2 = nn.Conv1d(
+            dim * expansion_factor,
+            dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+        )
+
+        # Dropout
+        self.dropout_layer = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -280,10 +378,38 @@ class ConformerConvModule(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        # TODO: Implement forward pass
-        # Note: Need to transpose for Conv1d: (batch, dim, seq_len)
-        # Then transpose back: (batch, seq_len, dim)
-        raise NotImplementedError("ConformerConvModule.forward() not yet implemented")
+        # Apply layer normalization
+        x = self.norm(x)
+
+        # Transpose for Conv1d: (batch, seq_len, dim) → (batch, dim, seq_len)
+        x = x.transpose(1, 2)
+
+        # Pointwise expansion
+        x = self.pointwise_conv1(x)  # (batch, dim * expansion_factor * 2, seq_len)
+
+        # GLU activation: split channels and apply gating
+        x, gate = x.chunk(2, dim=1)  # Each: (batch, dim * expansion_factor, seq_len)
+        x = x * torch.sigmoid(gate)
+
+        # Depthwise convolution
+        x = self.depthwise_conv(x)  # (batch, dim * expansion_factor, seq_len)
+
+        # Batch normalization
+        x = self.batch_norm(x)
+
+        # Activation
+        x = self.activation(x)
+
+        # Pointwise compression
+        x = self.pointwise_conv2(x)  # (batch, dim, seq_len)
+
+        # Transpose back: (batch, dim, seq_len) → (batch, seq_len, dim)
+        x = x.transpose(1, 2)
+
+        # Dropout
+        x = self.dropout_layer(x)
+
+        return x
 
 
 # ============================================================================
@@ -316,13 +442,42 @@ class ConformerBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        # TODO: Implement Conformer block components
         # 1. First feed-forward module (with 0.5x scaling)
+        self.ff1 = ConformerFeedForward(
+            dim=config.hidden_dim,
+            mult=config.feedforward_mult,
+            dropout=config.dropout,
+            activation=config.activation,
+        )
+
         # 2. Multi-head attention module
+        self.attn = ConformerAttention(
+            dim=config.hidden_dim,
+            num_heads=config.num_heads,
+            dim_head=config.dim_head,
+            max_pos_emb=config.max_pos_emb,
+            dropout=config.dropout,
+        )
+
         # 3. Convolution module
+        self.conv = ConformerConvModule(
+            dim=config.hidden_dim,
+            kernel_size=config.conv_kernel_size,
+            expansion_factor=config.conv_expansion_factor,
+            dropout=config.dropout,
+            activation=config.activation,
+        )
+
         # 4. Second feed-forward module (with 0.5x scaling)
+        self.ff2 = ConformerFeedForward(
+            dim=config.hidden_dim,
+            mult=config.feedforward_mult,
+            dropout=config.dropout,
+            activation=config.activation,
+        )
+
         # 5. Post layer normalization
-        raise NotImplementedError("ConformerBlock not yet implemented")
+        self.post_norm = nn.LayerNorm(config.hidden_dim)
 
     def forward(
         self,
@@ -340,13 +495,22 @@ class ConformerBlock(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, hidden_dim)
         """
-        # TODO: Implement forward pass with residual connections
-        # 1. x = x + 0.5 * ff1(x)
-        # 2. x = x + attn(x, attention_dists)
-        # 3. x = x + conv(x)
-        # 4. x = x + 0.5 * ff2(x)
-        # 5. x = post_norm(x)
-        raise NotImplementedError("ConformerBlock.forward() not yet implemented")
+        # 1. x = x + 0.5 * ff1(x) - Half-step residual for feed-forward
+        x = x + 0.5 * self.ff1(x)
+
+        # 2. x = x + attn(x, attention_dists) - Full residual for attention
+        x = x + self.attn(x, attention_dists)
+
+        # 3. x = x + conv(x) - Full residual for convolution
+        x = x + self.conv(x)
+
+        # 4. x = x + 0.5 * ff2(x) - Half-step residual for feed-forward
+        x = x + 0.5 * self.ff2(x)
+
+        # 5. x = post_norm(x) - Post layer normalization
+        x = self.post_norm(x)
+
+        return x
 
 
 # ============================================================================
@@ -391,11 +555,17 @@ class ConformerEncoder(nn.Module):
         self.config = config
         self.distributed_strategy = distributed_strategy
 
-        # TODO: Implement encoder components
         # 1. Input projection: num_features → hidden_dim
+        self.input_proj = nn.Linear(config.num_features, config.hidden_dim)
+
         # 2. Stack of Conformer blocks (num_layers)
+        self.blocks = nn.ModuleList([
+            ConformerBlock(config) for _ in range(config.num_layers)
+        ])
+
         # 3. Register buffer for attention_dists (precomputed relative positions)
-        raise NotImplementedError("ConformerEncoder not yet implemented")
+        attention_dists = self._precompute_attention_dists(max_seq_len=5000)
+        self.register_buffer("attention_dists", attention_dists)
 
     def _precompute_attention_dists(self, max_seq_len: int = 5000) -> torch.Tensor:
         """
@@ -412,12 +582,24 @@ class ConformerEncoder(nn.Module):
         Returns:
             Distance matrix of shape (max_seq_len, max_seq_len) with values in [0, 2*max_pos_emb]
         """
-        # TODO: Implement attention distance precomputation
         # 1. Create position indices: [0, 1, 2, ..., max_seq_len-1]
+        positions = torch.arange(max_seq_len)
+
         # 2. Compute pairwise differences: pos[i] - pos[j]
+        # Using broadcasting: (max_seq_len, 1) - (1, max_seq_len) = (max_seq_len, max_seq_len)
+        relative_dists = positions.unsqueeze(0) - positions.unsqueeze(1)
+
         # 3. Clamp to [-context_size, context_size]
+        relative_dists = torch.clamp(
+            relative_dists,
+            min=-self.config.context_size,
+            max=self.config.context_size
+        )
+
         # 4. Shift by max_pos_emb to get indices in [0, 2*max_pos_emb]
-        raise NotImplementedError("_precompute_attention_dists() not yet implemented")
+        attention_dists = relative_dists + self.config.max_pos_emb
+
+        return attention_dists.long()
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """
@@ -433,13 +615,31 @@ class ConformerEncoder(nn.Module):
         Raises:
             AssertionError: If input_features dimension doesn't match config.num_features
         """
-        # TODO: Implement forward pass
         # 1. Validate input shape
+        batch_size, seq_len, num_features = input_features.shape
+        assert num_features == self.config.num_features, (
+            f"Input features dimension {num_features} doesn't match "
+            f"config.num_features {self.config.num_features}"
+        )
+
         # 2. Project input: (batch, seq_len, num_features) → (batch, seq_len, hidden_dim)
-        # 3. Extract or pad attention_dists for current sequence length
+        x = self.input_proj(input_features)
+
+        # 3. Extract attention_dists for current sequence length
+        # If sequence is longer than precomputed, we'll handle it
+        if seq_len > self.attention_dists.size(0):
+            # Dynamically compute for longer sequences
+            attention_dists = self._precompute_attention_dists(max_seq_len=seq_len)
+            attention_dists = attention_dists.to(input_features.device)
+        else:
+            attention_dists = self.attention_dists
+
         # 4. Pass through all Conformer blocks
+        for block in self.blocks:
+            x = block(x, attention_dists)
+
         # 5. Return final hidden states
-        raise NotImplementedError("ConformerEncoder.forward() not yet implemented")
+        return x
 
 
 # ============================================================================
