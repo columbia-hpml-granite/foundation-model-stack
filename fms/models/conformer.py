@@ -1,31 +1,5 @@
-"""
-Conformer: Convolution-augmented Transformer for Speech Recognition
-
-This module implements the Conformer architecture for acoustic modeling.
-Based on: "Conformer: Convolution-augmented Transformer for Speech Recognition"
-          (Gulati et al., 2020) https://arxiv.org/abs/2005.08100
-
-Architecture Overview:
-    Audio Features (80 log-mel) → Input Projection →
-    Conformer Block 1 → ... → Conformer Block N →
-    Acoustic Embeddings (hidden_dim)
-
-Conformer Block Structure:
-    x → LayerNorm → FeedForward1 (0.5x) →
-    LayerNorm → Attention →
-    LayerNorm → Convolution →
-    LayerNorm → FeedForward2 (0.5x) →
-    Post LayerNorm → output
-
-Reference Implementation:
-    - HuggingFace transformers: granite_speech/modeling_granite_speech.py
-    - Uses Shaw's relative positional embeddings for attention
-    - Depthwise separable convolution with GLU activation
-"""
-
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,24 +13,21 @@ from fms.utils.activation import str_to_activation
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
 @dataclass
 class ConformerConfig(ModelConfig):
     """
     Configuration class for Conformer encoder.
 
+    Default values are set to match Granite-Speech-3.3-8b specifications.
+
     Args:
-        num_features: Number of input audio features (default: 80 log-mel channels)
+        num_features: Number of input audio features (default: 160 = 80 log-mel * 2 channels)
         hidden_dim: Hidden dimension for encoder layers
         num_layers: Number of Conformer blocks (Granite-speech uses 16)
         num_heads: Number of attention heads in multi-head attention
         dim_head: Dimension per attention head
 
-        conv_kernel_size: Kernel size for depthwise convolution (default: 31)
+        conv_kernel_size: Kernel size for depthwise convolution (Granite-speech: 15)
         conv_expansion_factor: Expansion factor for convolution module (default: 2)
 
         feedforward_mult: Expansion multiplier for feed-forward networks (default: 4)
@@ -66,19 +37,20 @@ class ConformerConfig(ModelConfig):
         max_pos_emb: Maximum positional embedding distance for relative attention
         context_size: Local attention window size (sequence positions are clamped to +/- context_size)
 
+        output_dim: Output dimension after encoder (for Q-Former input)
         activation: Activation function name (default: "silu" for SiLU/Swish)
     """
 
-    num_features: int = 80  # Input: 80 log-mel filterbank features
+    num_features: int = 160  # Input: 80 log-mel * 2 channels (Granite-speech actual config)
     hidden_dim: int = 1024  # Encoder hidden dimension
     num_layers: int = 16  # Number of conformer blocks (Granite-speech default)
 
     # Multi-head attention parameters
     num_heads: int = 8
-    dim_head: int = 64  # Per-head dimension (num_heads * dim_head = inner_dim)
+    dim_head: int = 128  # Per-head dimension (8 heads * 128 = 1024 inner_dim)
 
     # Convolution module parameters
-    conv_kernel_size: int = 31
+    conv_kernel_size: int = 15  # Granite-speech uses kernel size 15
     conv_expansion_factor: int = 2
 
     # Feed-forward parameters
@@ -88,16 +60,14 @@ class ConformerConfig(ModelConfig):
     dropout: float = 0.1
 
     # Positional encoding parameters
-    max_pos_emb: int = 1000  # Maximum relative position distance
-    context_size: int = 100  # Local attention window (clamping range)
+    max_pos_emb: int = 512  # Maximum relative position distance (Granite-speech config)
+    context_size: int = 200  # Local attention window (Granite-speech config)
+
+    # Output dimension
+    output_dim: int = 256  # Output dimension for Q-Former input
 
     # Activation function
     activation: str = "silu"  # SiLU (Swish) activation
-
-
-# ============================================================================
-# Component Modules (Abstract Interfaces)
-# ============================================================================
 
 
 class ConformerFeedForward(nn.Module):
