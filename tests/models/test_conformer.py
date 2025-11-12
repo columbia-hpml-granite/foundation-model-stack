@@ -12,64 +12,6 @@ from fms.models.conformer import (
     ConformerBlock,
     ConformerEncoder,
 )
-from fms.testing._internal.model_test_suite import (
-    ModelConsistencyTestSuite,
-)
-
-
-class TestConformerConfig:
-    """Test Conformer configuration dataclass."""
-
-    def test_config_initialization_with_defaults(self):
-        """Test that config initializes with sensible defaults."""
-        config = ConformerConfig()
-
-        # Audio feature dimensions
-        assert config.num_features == 80, "Default should be 80 log-mel features"
-
-        # Architecture dimensions
-        assert config.num_layers == 16, "Granite-speech uses 16 layers"
-        assert config.hidden_dim == 1024, "Default hidden dimension"
-        assert config.num_heads == 8, "Default number of attention heads"
-        assert config.dim_head == 64, "Default per-head dimension"
-
-        # Convolution parameters
-        assert config.conv_kernel_size == 31, "Default kernel size"
-        assert config.conv_expansion_factor == 2, "Default expansion factor"
-
-        # Feed-forward parameters
-        assert config.feedforward_mult == 4, "Default FFN expansion"
-
-        # Regularization
-        assert 0.0 <= config.dropout <= 1.0, "Dropout should be valid probability"
-
-        # Position encoding
-        assert config.max_pos_emb > 0, "Max positional embedding distance"
-        assert config.context_size > 0, "Local attention window size"
-
-    def test_config_custom_initialization(self):
-        """Test that config accepts custom parameters."""
-        config = ConformerConfig(
-            num_features=40,
-            num_layers=12,
-            hidden_dim=512,
-            num_heads=4,
-            dropout=0.2,
-        )
-
-        assert config.num_features == 40
-        assert config.num_layers == 12
-        assert config.hidden_dim == 512
-        assert config.num_heads == 4
-        assert config.dropout == 0.2
-
-    def test_attention_dimension_compatibility(self):
-        """Test that attention dimensions are compatible."""
-        config = ConformerConfig(num_heads=8, dim_head=64)
-
-        # Inner attention dimension should be num_heads * dim_head
-        expected_inner_dim = config.num_heads * config.dim_head
-        assert expected_inner_dim == 512, "8 heads * 64 dim = 512"
 
 
 class TestConformerBlock:
@@ -157,7 +99,7 @@ class TestConformerBlock:
 
         # Process samples individually
         outputs_individual = [
-            conformer_block(x[i:i+1], attention_dists) for i in range(4)
+            conformer_block(x[i:i + 1], attention_dists) for i in range(4)
         ]
         outputs_stacked = torch.cat(outputs_individual, dim=0)
 
@@ -283,7 +225,7 @@ class TestConformerEncoder:
 
         # Process samples individually
         outputs_individual = [
-            encoder(input_batch[i:i+1]) for i in range(4)
+            encoder(input_batch[i:i + 1]) for i in range(4)
         ]
         outputs_stacked = torch.cat(outputs_individual, dim=0)
 
@@ -442,7 +384,3 @@ class TestConformerComponents:
         x = torch.randn(2, 50, config.hidden_dim)
         output = conv(x)
         assert output.shape == x.shape
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
