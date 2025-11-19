@@ -53,9 +53,13 @@ class SpeechProjectorConfig(ModelConfig):
                     Example: 500 audio frames � 32 queries (15.6x downsampling)
 
         # Q-Former architecture parameters
-        num_hidden_layers: Number of transformer layers in Q-Former (default: 6)
+        num_hidden_layers: Number of transformer layers in Q-Former (default: 2)
         num_attention_heads: Number of attention heads (default: 8)
         intermediate_size: Hidden size in feed-forward network (default: 4096)
+
+        # Window attention parameters
+        window_size: Optional local attention window size (default: None for full attention)
+                    If set, enables windowed cross-attention for efficiency
 
         # Regularization
         hidden_dropout_prob: Dropout probability for hidden layers (default: 0.1)
@@ -77,9 +81,15 @@ class SpeechProjectorConfig(ModelConfig):
     num_queries: int = 32  # Number of learnable queries (controls downsampling)
 
     # Q-Former architecture
-    num_hidden_layers: int = 6  # Number of transformer layers
+    num_hidden_layers: int = 2  # Number of transformer layers (Granite Speech uses 2-layer window query transformer)
     num_attention_heads: int = 8  # Number of attention heads
     intermediate_size: int = 4096  # FFN hidden size
+
+    # Window attention parameters
+    window_size: Optional[int] = None  # Local attention window size for cross-attention
+                                       # If None, use full attention (all queries attend to all encoder outputs)
+                                       # If set (e.g., 128), each query attends to a local window of encoder outputs
+                                       # Reduces computation from O(num_queries * audio_seq_len) to O(num_queries * window_size)
 
     # Regularization
     hidden_dropout_prob: float = 0.1
@@ -182,6 +192,11 @@ class QFormerCrossAttention(nn.Module):
 
     Queries attend to encoder outputs (keys/values from Conformer).
 
+    Window Attention (Optional):
+        If config.window_size is set, implements local windowed attention where each query
+        attends to a local window of encoder outputs, reducing computation from
+        O(num_queries * audio_seq_len) to O(num_queries * window_size).
+
     Args:
         config: SpeechProjectorConfig with attention parameters
     """
@@ -189,6 +204,7 @@ class QFormerCrossAttention(nn.Module):
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         self.config = config
+        self.window_size = config.window_size
 
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = config.encoder_dim // config.num_attention_heads
@@ -226,10 +242,14 @@ class QFormerCrossAttention(nn.Module):
         # 2. Project encoder outputs (K, V from encoder_hidden_states)
         # 3. Reshape for multi-head attention
         # 4. Compute attention scores (Q @ K^T / sqrt(d_k))
-        # 5. Apply encoder attention mask if provided
-        # 6. Apply softmax and dropout
-        # 7. Apply attention to values (attn_weights @ V)
-        # 8. Reshape and return
+        # 5. If self.window_size is set:
+        #    - Apply windowed attention: each query attends to a local window
+        #    - Window center for query i: (i / num_queries) * audio_seq_len
+        #    - Window range: [center - window_size//2, center + window_size//2]
+        # 6. Apply encoder attention mask if provided
+        # 7. Apply softmax and dropout
+        # 8. Apply attention to values (attn_weights @ V)
+        # 9. Reshape and return
         raise NotImplementedError
 
 
@@ -573,7 +593,7 @@ SPEECH_PROJECTOR_CONFIGS = {
         encoder_dim=1024,
         decoder_dim=2048,
         num_queries=32,
-        num_hidden_layers=6,
+        num_hidden_layers=2,  # Granite Speech uses 2-layer window query transformer
         num_attention_heads=8,
         intermediate_size=4096,
     ),
