@@ -63,8 +63,12 @@ class ConformerConfig(ModelConfig):
     max_pos_emb: int = 512  # Maximum relative position distance (Granite-speech config)
     context_size: int = 200  # Local attention window (Granite-speech config)
 
-    # Output dimension
-    output_dim: int = 256  # Output dimension for Q-Former input
+    # CTC output dimension (HF: output_dim)
+    # Used for mid-layer CTC auxiliary supervision
+    output_dim: int = 42  # HF default: 42 (CTC vocabulary size)
+
+    # Enable/disable mid-layer CTC output
+    use_ctc: bool = True  # Set to True for HF-compatible behavior
 
     # Activation function
     activation: str = "silu"  # SiLU (Swish) activation
@@ -533,7 +537,18 @@ class ConformerEncoder(nn.Module):
             ConformerBlock(config) for _ in range(config.num_layers)
         ])
 
-        # 3. Register buffer for attention_dists (precomputed relative positions)
+        # 3. CTC output layers (HF-aligned: mid-layer CTC supervision)
+        # Reference: HF modeling_granite_speech.py:265-278
+        if config.use_ctc:
+            # out: projects hidden_dim → output_dim (CTC logits)
+            self.out = nn.Linear(config.hidden_dim, config.output_dim)
+            # out_mid: projects output_dim → hidden_dim (feedback to encoder)
+            self.out_mid = nn.Linear(config.output_dim, config.hidden_dim)
+        else:
+            self.out = None
+            self.out_mid = None
+
+        # 4. Register buffer for attention_dists (precomputed relative positions)
         attention_dists = self._precompute_attention_dists(max_seq_len=5000)
         self.register_buffer("attention_dists", attention_dists)
 
@@ -604,9 +619,17 @@ class ConformerEncoder(nn.Module):
         else:
             attention_dists = self.attention_dists
 
-        # 4. Pass through all Conformer blocks
-        for block in self.blocks:
+        # 4. Pass through all Conformer blocks with optional mid-layer CTC
+        # Reference: HF modeling_granite_speech.py:270-278
+        mid_layer = len(self.blocks) // 2
+        for idx, block in enumerate(self.blocks, start=1):
             x = block(x, attention_dists)
+
+            # Mid-layer CTC feedback (HF-aligned)
+            # At the middle layer, compute CTC output and feed back into encoder
+            if self.config.use_ctc and self.out is not None and idx == mid_layer:
+                x_mid = self.out(x)  # (batch, seq_len, output_dim)
+                x = x + self.out_mid(F.softmax(x_mid, dim=-1))  # Feedback to encoder
 
         # 5. Return final hidden states
         return x
