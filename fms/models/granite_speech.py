@@ -240,7 +240,8 @@ class GraniteSpeech(nn.Module):
 
     def post_init(self):
         """Post-initialization hook after model is on correct device."""
-        pass
+        # Hook left available for optional weight tying or device-specific setup.
+        return
 
     def get_input_embeddings(self):
         """Get input embeddings from the decoder."""
@@ -289,28 +290,32 @@ class GraniteSpeech(nn.Module):
         Returns:
             Merged embeddings of shape (batch, seq_len, decoder_dim)
         """
-        # 1. Find audio token positions
-        is_audio_index = input_ids == self.audio_token_index
-
-        # 2. Get text embeddings, replacing audio tokens with 0 to avoid OOV
-        llm_input_ids = torch.where(is_audio_index, 0, input_ids)
-        inputs_embeds = self.get_input_embeddings()(llm_input_ids)
-
-        # 3. Mask audio features into the embeddings at audio token positions
-        special_audio_mask = is_audio_index.unsqueeze(-1)
-        audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-
-        # 4. Apply optional features mask (for variable-length audio)
-        if input_features_mask is not None:
-            audio_features = audio_features[input_features_mask]
-
-        # 5. Scatter audio features into text embeddings
-        inputs_embeds = inputs_embeds.masked_scatter(
-            special_audio_mask,
-            audio_features,
-        )
-
-        return inputs_embeds
+        # Finding positions of audio placeholder tokens
+        audio_pos = (input_ids == self.audio_token_index)
+    
+        # Replacing audio tokens with a safe id for embedding lookup
+        safe_ids = torch.where(audio_pos, input_ids.new_zeros(()), input_ids)
+    
+        # Getting base token embeddings
+        token_embeds = self.get_input_embeddings()(safe_ids)
+    
+        # Audio features come in (B, N_audio, d). Selecting valid features
+        audio_features = audio_features.to(token_embeds.device, token_embeds.dtype)
+        audio_flat = audio_features[input_features_mask]  # (K, d)
+    
+        # Expecting exact match between placeholders and audio vectors
+        expected = audio_pos.sum().item()
+        if expected * token_embeds.size(-1) != audio_flat.numel():
+            raise ValueError(
+                f"Mismatch: {expected} audio positions but "
+                f"{audio_flat.shape[0]} audio vectors provided."
+            )
+    
+        # Scattering audio vectors into placeholder positions
+        mask = audio_pos.unsqueeze(-1)  # (B, T, 1)
+        merged = token_embeds.masked_scatter(mask, audio_flat)
+    
+        return merged
 
     def forward(
         self,
@@ -344,60 +349,57 @@ class GraniteSpeech(nn.Module):
             Tuple of (logits, optional_loss, optional_past_key_values)
         """
         # Input validation
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Specify input_ids or inputs_embeds.")
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("input_ids and inputs_embeds are mutually exclusive.")
         if input_features is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_features and inputs_embeds at the same time"
-            )
-
-        # Get input embeddings
+            raise ValueError("input_features and inputs_embeds cannot be used together.")
+    
+        # Building embeddings
         if inputs_embeds is None:
             if input_features is not None:
-                # Multimodal forward: audio + text
-                # 1. Get projected audio features
+                if input_features_mask is None:
+                    raise ValueError("input_features_mask is required with input_features.")
+                # Extracting audio features
                 audio_embeds = self.get_audio_features(input_features)
-
-                # 2. Merge audio features into text embeddings
+                # Injecting audio into token stream
                 inputs_embeds = self.get_merged_audio_embeddings(
                     input_ids=input_ids,
                     audio_features=audio_embeds,
                     input_features_mask=input_features_mask,
                 )
             else:
-                # Text-only forward
+                # Text-only
                 inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        # Pass through decoder
-        # Note: GraniteHeadless checks x_in.dim() - if 3D, assumes already embedded
-        decoder_out, cache = self.decoder(
+    
+        # Decoder forward
+        dec_out, cache = self.decoder(
             x_in=inputs_embeds,
             position_ids=position_ids,
             past_key_value_states=past_key_values,
-            use_cache=use_cache if use_cache is not None else False,
+            attention_mask=attention_mask,
+            use_cache=bool(use_cache),
         )
-
+    
         # LM head
-        logits = self.lm_head(decoder_out)
-
-        # Compute loss if labels provided
+        logits = self.lm_head(dec_out)
+    
+        # Loss
         loss = None
         if labels is not None:
-            # Shift logits and labels for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-
-            # Flatten and compute cross-entropy
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
+    
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
-
-        # Return based on what was computed
+    
         if use_cache:
             return logits, loss, cache
+    
         return logits, loss
 
 
