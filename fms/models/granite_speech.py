@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fms import models
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
 from fms.models.conformer import ConformerConfig, ConformerEncoder
 from fms.models.granite import Granite, GraniteConfig, GraniteHeadless
@@ -301,7 +302,20 @@ class GraniteSpeech(nn.Module):
     
         # Audio features come in (B, N_audio, d). Selecting valid features
         audio_features = audio_features.to(token_embeds.device, token_embeds.dtype)
-        audio_flat = audio_features[input_features_mask]  # (K, d)
+        # Align mask shape with projected audio features; fallback to full mask
+        audio_mask = input_features_mask
+        if audio_mask.shape != audio_features.shape[:2]:
+            logger.warning(
+                "input_features_mask shape %s does not match projected audio shape %s; using full mask",
+                audio_mask.shape,
+                audio_features.shape[:2],
+            )
+            audio_mask = torch.ones(
+                audio_features.shape[:2],
+                device=audio_features.device,
+                dtype=torch.bool,
+            )
+        audio_flat = audio_features[audio_mask]  # (K, d)
     
         # Expecting exact match between placeholders and audio vectors
         expected = audio_pos.sum().item()
@@ -359,8 +373,20 @@ class GraniteSpeech(nn.Module):
         # Building embeddings
         if inputs_embeds is None:
             if input_features is not None:
+                if input_ids is None:
+                    raise ValueError("input_ids are required when using input_features.")
                 if input_features_mask is None:
-                    raise ValueError("input_features_mask is required with input_features.")
+                    input_features_mask = input_features.new_ones(
+                        input_features.shape[:2], dtype=torch.bool
+                    )
+                input_features_mask = input_features_mask.to(
+                    device=input_features.device, dtype=torch.bool
+                )
+                if input_features_mask.shape != input_features.shape[:2]:
+                    raise ValueError(
+                        "input_features_mask must match input_features shape "
+                        f"{input_features.shape[:2]}, got {input_features_mask.shape}"
+                    )
                 # Extracting audio features
                 audio_embeds = self.get_audio_features(input_features)
                 # Injecting audio into token stream
@@ -390,7 +416,9 @@ class GraniteSpeech(nn.Module):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-    
+
+            # Avoid NaNs/Infs in loss computation
+            shift_logits = torch.nan_to_num(shift_logits)
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -418,6 +446,41 @@ def _granite_speech_factory_factory(config: GraniteSpeechConfig):
 
 # Model architecture name
 _architecture_name = "granite_speech"
+
+# Register model variants so get_model() can instantiate Granite Speech
+_granite_speech_default = GraniteSpeechConfig()
+
+_granite_speech_2b = GraniteSpeechConfig(
+    encoder_config=_default_encoder_config,
+    projector_config=_default_projector_config.updated(decoder_dim=3072),
+    decoder_config=GraniteConfig(
+        src_vocab_size=49160,
+        emb_dim=3072,
+        norm_eps=1e-5,
+        nheads=24,
+        head_dim=128,
+        kvheads=8,
+        nlayers=32,
+        hidden_grow_factor=11008 / 3072,
+        max_expected_seq_len=8192,
+        rope_theta=10000.0,
+        pad_id=0,
+        p_dropout=0.0,
+        tie_heads=False,
+        fused_weights=True,
+    ),
+)
+
+models.register_model(
+    _architecture_name, "3.3-8b", _granite_speech_factory_factory(_granite_speech_default)
+)
+# Alias for HF 3.2 naming used in tests/docs
+models.register_model(
+    _architecture_name, "3.2-8b", _granite_speech_factory_factory(_granite_speech_default)
+)
+models.register_model(
+    _architecture_name, "3.3-2b", _granite_speech_factory_factory(_granite_speech_2b)
+)
 
 
 # ============================================================================

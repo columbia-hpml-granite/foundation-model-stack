@@ -76,6 +76,11 @@ class SpeechProjectorConfig(ModelConfig):
     encoder_dim: int = 1024 # Conformer output dimension
     decoder_dim: int = 2048 # Language decoder input dimension
 
+    # Window/downsampling (HF Granite Speech)
+    window_size: int = 15
+    downsample_rate: int = 5
+    num_queries: int = 3 # Derived as window_size // downsample_rate in HF
+
     # Q-Former architecture
     num_hidden_layers: int = 2 # Number of transformer layers (HF default)
     num_attention_heads: int = 16 # Number of attention heads (HF Blip2QFormer)
@@ -443,18 +448,39 @@ class SpeechProjector(nn.Module):
     def __init__(
         self,
         config: SpeechProjectorConfig,
-        window_size: int,
-        downsample_rate: int,
+        window_size: Optional[int] = None,
+        downsample_rate: Optional[int] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
     ):
         super().__init__()
         self.config = config
         self.distributed_strategy = distributed_strategy
 
-        # Window-based processing parameters (from parent GraniteSpeechConfig)
-        self.window_size = window_size
-        self.downsample_rate = downsample_rate
-        self.num_queries = window_size // downsample_rate
+        # Window-based processing parameters (prefer explicit args, fallback to config)
+        self.window_size = (
+            window_size
+            if window_size is not None
+            else getattr(config, "window_size", None)
+        )
+        self.downsample_rate = (
+            downsample_rate
+            if downsample_rate is not None
+            else getattr(config, "downsample_rate", None)
+        )
+        if self.window_size is None or self.downsample_rate is None:
+            raise ValueError("window_size and downsample_rate must be provided via args or config.")
+        # num_queries can be set in config; otherwise derive from window/downsample
+        self.num_queries = getattr(config, "num_queries", None)
+        if self.num_queries is None:
+            self.num_queries = self.window_size // self.downsample_rate
+        else:
+            expected = self.window_size // self.downsample_rate
+            if self.num_queries != expected:
+                logger.warning(
+                    "num_queries (%s) does not match window_size // downsample_rate (%s); using num_queries",
+                    self.num_queries,
+                    expected,
+                )
 
         # Learnable queries: (1, num_queries, encoder_dim) - matches HF shape
         self.query_embeds = nn.Parameter(
