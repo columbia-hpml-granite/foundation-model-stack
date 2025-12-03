@@ -12,6 +12,7 @@ and cross-attention mechanisms.
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -74,11 +75,10 @@ class SpeechProjectorConfig(ModelConfig):
     # Input/Output dimensions
     encoder_dim: int = 1024 # Conformer output dimension
     decoder_dim: int = 2048 # Language decoder input dimension
-    num_queries: int = 32 # Number of learnable queries (controls downsampling)
 
     # Q-Former architecture
-    num_hidden_layers: int = 6 # Number of transformer layers
-    num_attention_heads: int = 8 # Number of attention heads
+    num_hidden_layers: int = 2 # Number of transformer layers (HF default)
+    num_attention_heads: int = 16 # Number of attention heads (HF Blip2QFormer)
     intermediate_size: int = 4096 # FFN hidden size
 
     # Regularization
@@ -443,16 +443,25 @@ class SpeechProjector(nn.Module):
     def __init__(
         self,
         config: SpeechProjectorConfig,
+        window_size: int,
+        downsample_rate: int,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
     ):
         super().__init__()
         self.config = config
         self.distributed_strategy = distributed_strategy
 
-        # Learnable queries: (num_queries, encoder_dim)
+        # Window-based processing parameters (from parent GraniteSpeechConfig)
+        self.window_size = window_size
+        self.downsample_rate = downsample_rate
+        self.num_queries = window_size // downsample_rate
+
+        # Learnable queries: (1, num_queries, encoder_dim) - matches HF shape
         self.query_embeds = nn.Parameter(
-            torch.zeros(config.num_queries, config.encoder_dim)
+            torch.zeros(1, self.num_queries, config.encoder_dim)
         )
+        # Random initialization matching HuggingFace: N(0, 1)
+        nn.init.normal_(self.query_embeds, mean=0.0, std=1.0)
 
         # Stack of Q-Former layers
         self.layers = nn.ModuleList(
@@ -477,18 +486,18 @@ class SpeechProjector(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1)
 
-    def _expand_query_embeds(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def _expand_query_embeds(self, num_windows: int, device: torch.device) -> torch.Tensor:
         """
-        Expand learnable queries to batch size.
+        Expand learnable queries to number of windows.
 
         Args:
-            batch_size: Batch size for current forward pass
+            num_windows: batch_size * nblocks (total number of windows)
             device: device for the expanded tensor
 
         Returns:
-            Expanded queries of shape (batch, num_queries, encoder_dim)
+            Expanded queries of shape (num_windows, num_queries, encoder_dim)
         """
-        return self.query_embeds.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+        return self.query_embeds.expand(num_windows, -1, -1).to(device)
 
     def _prepare_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -513,7 +522,7 @@ class SpeechProjector(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass through Speech Projector.
+        Window-based forward pass through Speech Projector (matching HuggingFace).
 
         Args:
             encoder_hidden_states: Conformer output of shape (batch, audio_seq_len, encoder_dim)
@@ -521,49 +530,42 @@ class SpeechProjector(nn.Module):
                           Shape: (batch, audio_seq_len) with 1 for valid, 0 for padding
 
         Returns:
-            projected_states: Embeddings for decoder of shape (batch, num_queries, decoder_dim)
-
-        Example:
-            >>> config = SpeechProjectorConfig(
-            ...     encoder_dim=1024,
-            ...     decoder_dim=2048,
-            ...     num_queries=32,
-            ...     num_hidden_layers=6
-            ... )
-            >>> projector = SpeechProjector(config)
-            >>> encoder_output = torch.randn(2, 500, 1024)  # batch=2, seq_len=500
-            >>> decoder_input = projector(encoder_output)
-            >>> decoder_input.shape
-            torch.Size([2, 32, 2048])  # batch=2, queries=32, dim=2048
+            projected_states: Embeddings for decoder of shape (batch, nblocks * num_queries, decoder_dim)
+                            where nblocks = ceil(audio_seq_len / window_size)
         """
-        batch_size, seq_len, _ = encoder_hidden_states.shape
+        batch_size, seq_len, dim = encoder_hidden_states.shape
         device = encoder_hidden_states.device
 
-        # 1. Expand learnable queries to (B, Q, D_enc)
-        query_states = self._expand_query_embeds(batch_size, device=device)
+        # 1. Calculate number of windows and pad to multiple of window_size
+        nblocks = math.ceil(seq_len / self.window_size)
+        pad = nblocks * self.window_size - seq_len
+        if pad > 0:
+            encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, pad), "constant", 0)
 
-        # 2. Prepare encoder attention mask if provided
-        if attention_mask is not None:
-            encoder_attention_mask = self._prepare_attention_mask(attention_mask)
-        else:
-            encoder_attention_mask = None
+        # 2. Reshape to (batch * nblocks, window_size, dim)
+        encoder_hidden_states = encoder_hidden_states.view(
+            batch_size * nblocks, self.window_size, dim
+        )
 
-        # For now we don't use a query mask (all queries valid)
-        query_attention_mask = None
+        # 3. Expand queries for all windows: (1, Q, D) -> (batch * nblocks, Q, D)
+        query_states = self._expand_query_embeds(batch_size * nblocks, device=device)
 
-        # 3. Pass through all Q-Former layers
+        # 4. Pass through all Q-Former layers
         for layer in self.layers:
             query_states = layer(
                 query_states=query_states,
                 encoder_hidden_states=encoder_hidden_states,
-                query_attention_mask=query_attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
+                query_attention_mask=None,
+                encoder_attention_mask=None,
             )
 
-        # 4. Layer norm
+        # 5. Layer norm
         query_states = self.layer_norm(query_states)
 
-        # 5. Project to decoder_dim
+        # 6. Reshape back to (batch, nblocks * num_queries, dim)
+        query_states = query_states.view(batch_size, nblocks * self.num_queries, -1)
+
+        # 7. Project to decoder_dim
         projected_states = self.output_proj(query_states)
         return projected_states
 
@@ -576,8 +578,7 @@ class SpeechProjector(nn.Module):
 def _create_speech_projector_config(
     encoder_dim: int = 1024,
     decoder_dim: int = 2048,
-    num_queries: int = 32,
-    num_hidden_layers: int = 6,
+    num_hidden_layers: int = 2,
     **kwargs,
 ) -> SpeechProjectorConfig:
     """
@@ -586,7 +587,6 @@ def _create_speech_projector_config(
     Args:
         encoder_dim: Input dimension from encoder
         decoder_dim: Output dimension for decoder
-        num_queries: Number of learnable queries
         num_hidden_layers: Number of Q-Former layers
         **kwargs: Additional config parameters
 
@@ -596,7 +596,6 @@ def _create_speech_projector_config(
     return SpeechProjectorConfig(
         encoder_dim=encoder_dim,
         decoder_dim=decoder_dim,
-        num_queries=num_queries,
         num_hidden_layers=num_hidden_layers,
         **kwargs,
     )
@@ -607,16 +606,14 @@ SPEECH_PROJECTOR_CONFIGS = {
     "granite_speech_default": _create_speech_projector_config(
         encoder_dim=1024,
         decoder_dim=2048,
-        num_queries=32,
-        num_hidden_layers=6,
-        num_attention_heads=8,
+        num_hidden_layers=2,
+        num_attention_heads=16,
         intermediate_size=4096,
     ),
     "projector_small": _create_speech_projector_config(
         encoder_dim=512,
         decoder_dim=1024,
-        num_queries=16,
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         num_attention_heads=8,
         intermediate_size=2048,
     ),
