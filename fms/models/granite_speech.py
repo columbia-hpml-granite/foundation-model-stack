@@ -50,11 +50,10 @@ _default_encoder_config = ConformerConfig(
 )
 
 # Projector config matching HF Blip2QFormerConfig used in granite_speech
-# Note: HF uses window-based processing with window_size=15, downsample_rate=5
+# Note: window_size and downsample_rate are in GraniteSpeechConfig, not here
 _default_projector_config = SpeechProjectorConfig(
     encoder_dim=1024,           # Conformer output dimension
     decoder_dim=4096,           # Granite 8B hidden size
-    num_queries=3,              # window_size // downsample_rate = 15 // 5 = 3
     num_hidden_layers=2,        # HF uses 2-layer Q-Former
     num_attention_heads=16,     # HF Blip2QFormer heads
     intermediate_size=4096,     # FFN intermediate size
@@ -63,7 +62,6 @@ _default_projector_config = SpeechProjectorConfig(
     hidden_act="gelu",
     layer_norm_eps=1e-12,
     initializer_range=0.02,
-    window_size=15,             # HF: window_size for windowed processing
 )
 
 # Decoder config for Granite 8B (simplified - actual values from model)
@@ -199,7 +197,11 @@ class GraniteSpeech(nn.Module):
         self.encoder = ConformerEncoder(self.config.encoder_config)
 
         # 2. Q-Former Projector
-        self.projector = SpeechProjector(self.config.projector_config)
+        self.projector = SpeechProjector(
+            self.config.projector_config,
+            window_size=self.config.window_size,
+            downsample_rate=self.config.downsample_rate,
+        )
 
         # 3. Granite Decoder
         self.decoder = GraniteHeadless(self.config.decoder_config)
