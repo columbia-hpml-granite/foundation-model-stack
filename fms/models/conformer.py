@@ -23,7 +23,7 @@ class ConformerConfig(ModelConfig):
     Args:
         num_features: Number of input audio features (default: 160 = 80 log-mel * 2 channels)
         hidden_dim: Hidden dimension for encoder layers
-        num_layers: Number of Conformer blocks (Granite-speech uses 16)
+        num_layers: Number of Conformer blocks (HF default: 10, actual granite-speech-3.3-8b uses 16)
         num_heads: Number of attention heads in multi-head attention
         dim_head: Dimension per attention head
 
@@ -43,7 +43,7 @@ class ConformerConfig(ModelConfig):
 
     num_features: int = 160  # Input: 80 log-mel * 2 channels (Granite-speech actual config)
     hidden_dim: int = 1024  # Encoder hidden dimension
-    num_layers: int = 16  # Number of conformer blocks (Granite-speech default)
+    num_layers: int = 10  # Number of conformer blocks (HF default; actual granite-speech-3.3-8b uses 16)
 
     # Multi-head attention parameters
     num_heads: int = 8
@@ -643,7 +643,7 @@ class ConformerEncoder(nn.Module):
 def _create_conformer_config(
     num_features: int = 80,
     hidden_dim: int = 1024,
-    num_layers: int = 16,
+    num_layers: int = 10,
     num_heads: int = 8,
     dim_head: int = 64,
     **kwargs,
@@ -674,6 +674,16 @@ def _create_conformer_config(
 
 # Predefined configurations for common variants
 CONFORMER_CONFIGS = {
+    "granite_speech_10L_1024H": _create_conformer_config(
+        num_features=80,
+        hidden_dim=1024,
+        num_layers=10,
+        num_heads=8,
+        dim_head=64,
+        conv_kernel_size=31,
+        feedforward_mult=4,
+        dropout=0.1,
+    ),
     "granite_speech_16L_1024H": _create_conformer_config(
         num_features=80,
         hidden_dim=1024,
