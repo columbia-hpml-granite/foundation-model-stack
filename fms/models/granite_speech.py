@@ -36,18 +36,18 @@ logger = logging.getLogger(__name__)
 
 # Encoder config matching HF GraniteSpeechEncoderConfig defaults
 _default_encoder_config = ConformerConfig(
-    num_features=160,       # 80 log-mel * 2 channels
-    hidden_dim=1024,        # HF: hidden_dim
-    num_layers=10,          # HF: num_layers (HF default is 10; actual granite-speech-3.3-8b uses 16)
-    num_heads=8,            # HF: num_heads
-    dim_head=128,           # HF: dim_head
-    conv_kernel_size=15,    # HF: conv_kernel_size
+    num_features=160,         # 80 log-mel * 2 channels
+    hidden_dim=1024,          # HF: hidden_dim
+    num_layers=16,            # HF: num_layers
+    num_heads=8,              # HF: num_heads
+    dim_head=128,             # HF: dim_head
+    conv_kernel_size=15,      # HF: conv_kernel_size
     conv_expansion_factor=2,  # HF: conv_expansion_factor
-    feedforward_mult=4,     # HF: feedforward_mult
-    dropout=0.1,            # HF: dropout
-    max_pos_emb=512,        # HF: max_pos_emb
-    context_size=200,       # HF: context_size
-    output_dim=42,          # HF: output_dim (CTC output dimension)
+    feedforward_mult=4,       # HF: feedforward_mult
+    dropout=0.1,              # HF: dropout
+    max_pos_emb=512,          # HF: max_pos_emb
+    context_size=200,         # HF: context_size
+    output_dim=42,            # HF: output_dim (CTC output dimension)
 )
 
 # Projector config matching HF Blip2QFormerConfig used in granite_speech
