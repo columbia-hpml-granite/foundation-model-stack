@@ -1115,12 +1115,16 @@ class TestGraniteSpeechE2E:
 
     Tests the full pipeline using FMS-native components:
     - GraniteSpeech model
-    - GraniteSpeechFeatureExtractor
-    - GraniteSpeechProcessor
+    - GraniteSpeechFeatureExtractor (fully implemented)
+    - GraniteSpeechProcessor (fully implemented)
 
-    Note: These tests use skeleton implementations. Once the FMS processor
-    and feature extractor are fully implemented, these tests will validate
-    the complete E2E flow.
+    These tests validate the complete E2E flow including:
+    - Real audio loading from LibriSpeech dataset
+    - Mel-spectrogram feature extraction
+    - Audio token expansion in text
+    - Model forward pass with audio features
+
+    Reference: HF test_modeling_granite_speech.py L296-378
     """
 
     @pytest.fixture
@@ -1297,15 +1301,22 @@ class TestGraniteSpeechE2E:
         assert "audio_embed_sizes" in result
         assert "input_features_mask" in result
 
+    @requires_torchaudio
     @pytest.mark.slow
     def test_fms_e2e_with_real_audio(self, small_config, mock_tokenizer):
         """
         E2E test with real audio from LibriSpeech dataset.
 
-        Note: This test uses skeleton implementations for processor/feature extractor.
-        The test validates that the pipeline structure works, but actual audio
-        processing will only work once the implementations are complete.
+        This test validates the full pipeline:
+        1. Load real audio from LibriSpeech
+        2. Process audio through GraniteSpeechFeatureExtractor
+        3. Process text + audio through GraniteSpeechProcessor
+        4. Forward pass through GraniteSpeech model
+
+        HF Source: test_modeling_granite_speech.py L318-349
         """
+        import math
+
         # Load real audio samples
         ds = load_dataset(
             "hf-internal-testing/librispeech_asr_dummy",
@@ -1317,30 +1328,115 @@ class TestGraniteSpeechE2E:
         audio_array = speech_samples[0]["array"]
 
         # Create FMS components
-        model = GraniteSpeech(small_config)
-        model.eval()
-
         feature_extractor = GraniteSpeechFeatureExtractor()
         processor = GraniteSpeechProcessor(
             audio_processor=feature_extractor,
             tokenizer=mock_tokenizer,
         )
 
-        # Process text (audio processing is skeleton)
+        # Convert audio to tensor
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
+
+        # Process text with audio placeholder
         text = "<|audio|> transcribe this audio"
-        processed = processor(text=text)
+        processed = processor(text=text, audio=audio_tensor)
 
         # Verify processor output structure
         assert isinstance(processed, dict)
         assert "input_ids" in processed
+        assert "input_features" in processed
+        assert "input_features_mask" in processed
+        assert processed["input_features"] is not None
 
-        # Test model with text-only forward (since feature extractor is skeleton)
-        # Once feature extractor is implemented, this should use audio features
-        input_ids = torch.randint(1, 998, (1, 20))
+        # Verify audio feature shape (batch, mel_seq_len, 160)
+        assert processed["input_features"].dim() == 3
+        assert processed["input_features"].shape[0] == 1  # batch size
+        assert processed["input_features"].shape[2] == 160  # n_mels * 2
 
+        # Verify audio feature mask
+        assert processed["input_features_mask"] is not None
+
+        # Calculate expected audio tokens for the model
+        # Need to match audio_token_index placeholders with projected features
+        audio_lengths = [len(audio_array)]
+        num_audio_features = feature_extractor._get_num_audio_features(audio_lengths)[0]
+
+        # Create model with matching config
+        # Update config to have enough vocab for our mock tokenizer
+        model = GraniteSpeech(small_config)
+        model.eval()
+
+        # Create input_ids with correct number of audio tokens
+        # The processor expands <|audio|> to num_audio_features copies
+        text_tokens = 20  # approximate text length
+        total_seq_len = num_audio_features + text_tokens
+        input_ids = torch.randint(1, 998, (1, total_seq_len))
+        input_ids[0, :num_audio_features] = small_config.audio_token_index
+
+        # Forward pass with real audio features
         with torch.no_grad():
-            logits, loss = model(input_ids=input_ids)
+            logits, loss = model(
+                input_ids=input_ids,
+                input_features=processed["input_features"],
+                input_features_mask=processed["input_features_mask"],
+            )
 
         assert logits is not None
         assert logits.shape[0] == 1  # batch size
         assert logits.shape[2] == small_config.decoder_config.src_vocab_size
+        assert not torch.isnan(logits).any().item()
+
+    @requires_torchaudio
+    @pytest.mark.slow
+    def test_fms_e2e_with_real_audio_batch(self, small_config, mock_tokenizer):
+        """
+        E2E test with batched real audio from LibriSpeech dataset.
+
+        Tests the full pipeline with multiple audio samples of different lengths.
+
+        HF Source: test_modeling_granite_speech.py L351-378
+        """
+        # Load multiple real audio samples
+        ds = load_dataset(
+            "hf-internal-testing/librispeech_asr_dummy",
+            "clean",
+            split="validation",
+            trust_remote_code=True,
+        )
+        speech_samples = ds.sort("id")[:2]["audio"]
+        audio_arrays = [sample["array"] for sample in speech_samples]
+
+        # Create FMS components
+        feature_extractor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=feature_extractor,
+            tokenizer=mock_tokenizer,
+        )
+
+        # Convert audio to tensors
+        audio_tensors = [torch.tensor(arr, dtype=torch.float32) for arr in audio_arrays]
+
+        # Process text with audio placeholder (one per audio)
+        texts = [
+            "<|audio|> transcribe the first audio",
+            "<|audio|> transcribe the second audio",
+        ]
+        processed = processor(text=texts, audio=audio_tensors)
+
+        # Verify processor output structure
+        assert isinstance(processed, dict)
+        assert "input_ids" in processed
+        assert "input_features" in processed
+        assert "input_features_mask" in processed
+
+        # Verify batch dimension
+        assert processed["input_features"].shape[0] == 2  # batch size
+
+        # Verify feature sizes match computed features
+        audio_lengths = [len(arr) for arr in audio_arrays]
+        num_computed_features = feature_extractor._get_num_audio_features(audio_lengths)
+
+        # Mask should have shape (batch, max_features)
+        num_actual_features = torch.sum(processed["input_features_mask"], dim=-1)
+        for expected, actual in zip(num_computed_features, num_actual_features):
+            assert expected == actual.item()
