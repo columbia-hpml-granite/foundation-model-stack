@@ -35,6 +35,19 @@ try:
 except ImportError:
     TORCHAUDIO_AVAILABLE = False
 
+# Optional PEFT import for LoRA adapters
+try:
+    from peft import PeftModel  # noqa: F401
+
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
+
+def is_peft_available() -> bool:
+    """Return True if `peft` is installed."""
+    return PEFT_AVAILABLE
+
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +128,7 @@ class GraniteSpeechConfig(ModelConfig):
         projector_config: SpeechProjectorConfig for Q-Former projector
         decoder_config: GraniteConfig for the language decoder
         audio_token_index: Special token ID for audio placeholder (default: 49155)
+        has_lora_adapter: Whether LoRA adapters should be toggled on only for audio inputs (default: True)
         downsample_rate: Temporal downsampling rate in projector (default: 5)
         window_size: Window size for projector's windowed attention (default: 15)
         initializer_range: Std for weight initialization (default: 0.02)
@@ -132,6 +146,7 @@ class GraniteSpeechConfig(ModelConfig):
 
     # Audio token settings (from HF GraniteSpeechConfig)
     audio_token_index: int = 49155
+    has_lora_adapter: bool = True
 
     # Projector window settings (from HF)
     # These control temporal compression:
@@ -196,6 +211,7 @@ class GraniteSpeech(nn.Module):
         # Allow runtime parameter overrides
         self.config = self.config.updated(**kwargs) if kwargs else self.config
         self.distributed_strategy = distributed_strategy
+        self._peft_adapter_loaded = False
 
         # Store commonly accessed config values
         self.audio_token_index = self.config.audio_token_index
@@ -234,14 +250,81 @@ class GraniteSpeech(nn.Module):
             for param in self.lm_head.parameters():
                 param.requires_grad = False
 
+        if self.config.has_lora_adapter and not is_peft_available():
+            logger.warning(
+                "Config indicates that a lora adapter should be present, but "
+                "peft is not installed; this will cause the model to perform "
+                "incorrectly when audio inputs are provided. Please install "
+                "peft and reload the model!"
+            )
+
     @classmethod
     def from_config(cls, config: GraniteSpeechConfig) -> "GraniteSpeech":
         """Factory method to construct from config."""
         return cls(config)
 
+    def load_adapter(self, adapter_path: str):
+        """
+        Manually load a PEFT LoRA adapter onto the decoder.
+
+        HF does this automatically via PreTrainedModel; FMS requires an explicit call.
+        """
+        if not is_peft_available():
+            raise ImportError("peft is required to load LoRA adapters. Please install peft.")
+
+        from peft import PeftModel
+
+        self.decoder = PeftModel.from_pretrained(self.decoder, adapter_path)
+        self._peft_adapter_loaded = True
+
     def get_config(self) -> GraniteSpeechConfig:
         """Return current config."""
         return self.config
+
+    def _maybe_toggle_adapters(self, input_features: Optional[torch.Tensor]):
+        """
+        Enable or disable PEFT adapters based on whether audio features are present.
+
+        HF does this inside generate(); in FMS we call this from generation hooks.
+        """
+        if not (is_peft_available() and self._peft_adapter_loaded):
+            return
+
+        if input_features is not None:
+            self.decoder.enable_adapters()
+        else:
+            self.decoder.disable_adapters()
+
+    @staticmethod
+    def _fix_state_dict_key_on_save(key: str) -> Tuple[str, bool]:
+        """
+        Adjust state dict key names when saving with adapters.
+
+        Mirrors HF behavior by stripping `.base_layer` and returning a flag
+        indicating whether the key should be kept (always True here).
+        """
+        return key.replace(".base_layer", ""), False
+
+    def _fix_state_dict_keys_on_save(self, state_dict: Mapping[str, Any]) -> Mapping[str, Any]:
+        """
+        Strip adapter keys when saving base weights unless an adapter is active.
+        """
+        if is_peft_available() and self._peft_adapter_loaded:
+            return state_dict
+
+        fixed = {}
+        for key, value in state_dict.items():
+            if ".lora_" in key:
+                continue
+            new_key, _ = self._fix_state_dict_key_on_save(key)
+            fixed[new_key] = value
+        return fixed
+
+    def _get_adapter_name(self) -> str:
+        """Return the first adapter name from the decoder's PEFT config."""
+        if not hasattr(self.decoder, "peft_config"):
+            raise ValueError("Decoder does not have PEFT adapters loaded.")
+        return list(self.decoder.peft_config.keys())[0]
 
     def reset_parameters(self):
         """Initialize all trainable parameters."""
@@ -497,6 +580,10 @@ class GraniteSpeech(nn.Module):
         # Extract audio features from kwargs
         input_features = kwargs.pop("input_features", None)
         input_features_mask = kwargs.pop("input_features_mask", None)
+
+        # Toggle adapters based on presence of audio (first/prefill step only)
+        if iteration == 0:
+            self._maybe_toggle_adapters(input_features)
         
         # No audio data to process
         if input_features is None:
@@ -1159,4 +1246,5 @@ __all__ = [
     "GraniteSpeechConfig",
     "GraniteSpeechFeatureExtractor",
     "GraniteSpeechProcessor",
+    "is_peft_available",
 ]
