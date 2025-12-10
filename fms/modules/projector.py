@@ -14,23 +14,18 @@ and cross-attention mechanisms.
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
-from fms.utils.config import ModelConfig
 from fms.utils.activation import str_to_activation
+from fms.utils.config import ModelConfig
 
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Configuration
-# ============================================================================
 
 
 @dataclass
@@ -42,20 +37,21 @@ class SpeechProjectorConfig(ModelConfig):
     performing temporal downsampling and cross-modal alignment.
 
     Architecture:
-        Conformer output (batch, audio_seq_len, encoder_dim) →
-        Q-Former with learnable queries →
+        Conformer output (batch, audio_seq_len, encoder_dim) ->
+        Q-Former with learnable queries ->
         Projected output (batch, num_queries, decoder_dim)
 
     Args:
         encoder_dim: Input dimension from Conformer encoder (default: 1024)
         decoder_dim: Output dimension for language decoder (default: 2048)
-        num_queries: Number of learnable queries for downsampling (default: 32)
-                    This controls the temporal downsampling ratio.
-                    Example: 500 audio frames → 32 queries (15.6x downsampling)
+        window_size: Window size for temporal downsampling (default: 15)
+        downsample_rate: Downsampling rate (default: 5)
+        num_queries: Number of learnable queries per window (default: 3)
+                    Derived as window_size // downsample_rate
 
         # Q-Former architecture parameters
-        num_hidden_layers: Number of transformer layers in Q-Former (default: 6)
-        num_attention_heads: Number of attention heads (default: 8)
+        num_hidden_layers: Number of transformer layers in Q-Former (default: 2)
+        num_attention_heads: Number of attention heads (default: 16)
         intermediate_size: Hidden size in feed-forward network (default: 4096)
 
         # Regularization
@@ -98,11 +94,6 @@ class SpeechProjectorConfig(ModelConfig):
 
     # Initialization
     initializer_range: float = 0.02
-
-
-# ============================================================================
-# Q-Former Components
-# ============================================================================
 
 
 class QFormerSelfAttention(nn.Module):
@@ -306,9 +297,9 @@ class QFormerFeedForward(nn.Module):
     Feed-forward network for Q-Former transformer block.
 
     Architecture:
-        hidden_states → Linear (encoder_dim → intermediate_size) →
-        Activation (GELU) → Linear (intermediate_size → encoder_dim) →
-        Dropout → LayerNorm (with residual)
+        hidden_states -> Linear (encoder_dim -> intermediate_size) ->
+        Activation (GELU) -> Linear (intermediate_size -> encoder_dim) ->
+        Dropout -> LayerNorm (with residual)
 
     Args:
         config: SpeechProjectorConfig with FFN parameters
@@ -402,11 +393,6 @@ class QFormerLayer(nn.Module):
         return query_states
 
 
-# ============================================================================
-# Speech Projector (Q-Former)
-# ============================================================================
-
-
 class SpeechProjector(nn.Module):
     """
     Speech Projector module for Granite Speech.
@@ -426,11 +412,12 @@ class SpeechProjector(nn.Module):
     3. **Dimension Projection**: Matches decoder input dimension
        - Projects from encoder_dim (1024) to decoder_dim (2048)
 
-    Architecture:
-        Conformer output (batch, audio_seq_len, encoder_dim) →
-        Learnable Queries (batch, num_queries, encoder_dim) →
-        Q-Former Layers (self-attention + cross-attention + FFN) × num_layers →
-        Output Projection (encoder_dim → decoder_dim) →
+    Architecture (matching HuggingFace BLIP-2 Q-Former):
+        Conformer output (batch, audio_seq_len, encoder_dim) ->
+        Learnable Queries (batch, num_queries, encoder_dim) ->
+        Input LayerNorm + Dropout ->
+        Q-Former Layers (self-attention + cross-attention + FFN) × num_layers ->
+        Output Projection (encoder_dim -> decoder_dim) ->
         Projected output (batch, num_queries, decoder_dim)
 
     Args:
@@ -489,13 +476,15 @@ class SpeechProjector(nn.Module):
         # Random initialization matching HuggingFace: N(0, 1)
         nn.init.normal_(self.query_embeds, mean=0.0, std=1.0)
 
+        # Input layer norm and dropout (applied to query embeddings before Q-Former)
+        # This matches HuggingFace BLIP-2 Q-Former architecture
+        self.input_layernorm = nn.LayerNorm(config.encoder_dim, eps=config.layer_norm_eps)
+        self.input_dropout = nn.Dropout(config.hidden_dropout_prob)
+
         # Stack of Q-Former layers
         self.layers = nn.ModuleList(
             [QFormerLayer(config) for _ in range(config.num_hidden_layers)]
         )
-
-        # Layer norm before projection
-        self.layer_norm = nn.LayerNorm(config.encoder_dim, eps=config.layer_norm_eps)
 
         # Output projection to decoder dimension
         self.output_proj = nn.Linear(config.encoder_dim, config.decoder_dim)
@@ -576,7 +565,11 @@ class SpeechProjector(nn.Module):
         # 3. Expand queries for all windows: (1, Q, D) -> (batch * nblocks, Q, D)
         query_states = self._expand_query_embeds(batch_size * nblocks, device=device)
 
-        # 4. Pass through all Q-Former layers
+        # 4. Apply input LayerNorm and dropout (matching HuggingFace BLIP-2 Q-Former)
+        query_states = self.input_layernorm(query_states)
+        query_states = self.input_dropout(query_states)
+
+        # 5. Pass through all Q-Former layers
         for layer in self.layers:
             query_states = layer(
                 query_states=query_states,
@@ -585,72 +578,9 @@ class SpeechProjector(nn.Module):
                 encoder_attention_mask=None,
             )
 
-        # 5. Layer norm
-        query_states = self.layer_norm(query_states)
-
         # 6. Reshape back to (batch, nblocks * num_queries, dim)
         query_states = query_states.view(batch_size, nblocks * self.num_queries, -1)
 
         # 7. Project to decoder_dim
         projected_states = self.output_proj(query_states)
         return projected_states
-
-
-# ============================================================================
-# Factory Functions and Model Registration
-# ============================================================================
-
-
-def _create_speech_projector_config(
-    encoder_dim: int = 1024,
-    decoder_dim: int = 2048,
-    num_hidden_layers: int = 2,
-    **kwargs,
-) -> SpeechProjectorConfig:
-    """
-    Factory function for creating Speech Projector configurations.
-
-    Args:
-        encoder_dim: Input dimension from encoder
-        decoder_dim: Output dimension for decoder
-        num_hidden_layers: Number of Q-Former layers
-        **kwargs: Additional config parameters
-
-    Returns:
-        SpeechProjectorConfig instance
-    """
-    return SpeechProjectorConfig(
-        encoder_dim=encoder_dim,
-        decoder_dim=decoder_dim,
-        num_hidden_layers=num_hidden_layers,
-        **kwargs,
-    )
-
-
-# Predefined configurations for common use cases
-SPEECH_PROJECTOR_CONFIGS = {
-    "granite_speech_default": _create_speech_projector_config(
-        encoder_dim=1024,
-        decoder_dim=2048,
-        num_hidden_layers=2,
-        num_attention_heads=16,
-        intermediate_size=4096,
-    ),
-    "projector_small": _create_speech_projector_config(
-        encoder_dim=512,
-        decoder_dim=1024,
-        num_hidden_layers=2,
-        num_attention_heads=8,
-        intermediate_size=2048,
-    ),
-}
-
-# TODO: Register with FMS model registry if needed
-# from fms import models
-# _module_name = "speech_projector"
-# for variant_name, config in SPEECH_PROJECTOR_CONFIGS.items():
-#     models.register_model(
-#         _module_name,
-#         variant_name,
-#         lambda c=config: SpeechProjector(c)
-#     )
