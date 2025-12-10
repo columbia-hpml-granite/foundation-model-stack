@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +27,13 @@ from fms.models.conformer import ConformerConfig, ConformerEncoder
 from fms.models.granite import Granite, GraniteConfig, GraniteHeadless
 from fms.modules.projector import SpeechProjector, SpeechProjectorConfig
 from fms.utils.config import ModelConfig
+
+# Optional torchaudio import for mel-spectrogram
+try:
+    import torchaudio
+    TORCHAUDIO_AVAILABLE = True
+except ImportError:
+    TORCHAUDIO_AVAILABLE = False
 
 
 logger = logging.getLogger(__name__)
@@ -797,6 +805,12 @@ class GraniteSpeechFeatureExtractor:
         projector_downsample_rate: int = 5,
         **kwargs,
     ):
+        if not TORCHAUDIO_AVAILABLE:
+            raise ImportError(
+                "torchaudio is required for GraniteSpeechFeatureExtractor. "
+                "Please install it with: pip install torchaudio"
+            )
+
         self.sampling_rate = sampling_rate
         self.n_fft = n_fft
         self.win_length = win_length
@@ -805,14 +819,19 @@ class GraniteSpeechFeatureExtractor:
         self.projector_window_size = projector_window_size
         self.projector_downsample_rate = projector_downsample_rate
 
-        # TODO: Initialize mel filterbank transform
-        # This should create a mel-spectrogram transformer similar to HF's torchaudio.transforms.MelSpectrogram
-        # self.mel_filters = ...
-        logger.warning("GraniteSpeechFeatureExtractor: mel_filters initialization not implemented")
+        # Initialize mel filterbank transform
+        self.melspec_kwargs = {
+            "sample_rate": sampling_rate,
+            "n_fft": n_fft,
+            "win_length": win_length,
+            "hop_length": hop_length,
+            "n_mels": n_mels,
+        }
+        self.mel_filters = torchaudio.transforms.MelSpectrogram(**self.melspec_kwargs)
 
     def __call__(
         self,
-        audios: Union[torch.Tensor, Sequence[torch.Tensor]],
+        audios: Union[torch.Tensor, Sequence[torch.Tensor], np.ndarray, Sequence[np.ndarray]],
         device: Optional[str] = "cpu",
         **kwargs,
     ) -> dict:
@@ -820,39 +839,38 @@ class GraniteSpeechFeatureExtractor:
         Extract mel-spectrogram features from raw audio.
 
         Args:
-            audios: Raw audio waveforms as tensors or sequence of tensors
+            audios: Raw audio waveforms as tensors, numpy arrays, or sequence thereof
             device: Device to place tensors on (default: "cpu")
 
         Returns:
             Dictionary containing:
-                - input_features: Mel-spectrogram features (batch, seq_len, num_features)
-                - audio_embed_sizes: Sequence of audio embedding sizes after projection
-                - input_features_mask: Mask for valid audio features
+                - input_features: Mel-spectrogram features (batch, seq_len, num_features=160)
+                - audio_embed_sizes: List of audio embedding sizes after projection
+                - input_features_mask: Boolean mask for valid audio features (batch, max_embed_size)
         """
-        # TODO: Step 1 - Validate and batch audio inputs
-        # Convert numpy arrays to torch tensors if needed
-        # Handle both single audio and batched audio
-        # batched_audio, audio_lengths = self._get_audios_and_audio_lengths(audios)
+        speech_inputs = {}
 
-        # TODO: Step 2 - Extract mel-spectrogram features
-        # Apply mel filterbank to convert raw audio to log-mel features
-        # Normalize and stack features (2 frames stacked together)
-        # input_features = self._extract_mel_spectrograms(batched_audio, device=device)
+        # Step 1: Validate and batch audio inputs
+        batched_audio, audio_lengths = self._get_audios_and_audio_lengths(audios)
 
-        # TODO: Step 3 - Calculate audio embedding sizes after projection
-        # This determines how many embeddings will be output from the projector
-        # audio_embed_sizes = self._get_num_audio_features(audio_lengths)
+        # Step 2: Extract mel-spectrogram features
+        speech_inputs["input_features"] = self._extract_mel_spectrograms(
+            batched_audio,
+            device=device,
+        )
 
-        # TODO: Step 4 - Create attention mask for audio features
-        # Mask should indicate which positions contain valid audio vs padding
-        # input_features_mask = self._create_attention_mask(audio_embed_sizes)
+        # Step 3: Calculate audio embedding sizes after projection
+        audio_embed_sizes = self._get_num_audio_features(audio_lengths)
+        speech_inputs["audio_embed_sizes"] = audio_embed_sizes
 
-        logger.warning("GraniteSpeechFeatureExtractor.__call__ not implemented - returning dummy output")
-        return {
-            "input_features": None,
-            "audio_embed_sizes": None,
-            "input_features_mask": None,
-        }
+        # Step 4: Create attention mask for audio features
+        # Note: mask shape is (batch, max_embed_size) which differs from input_features shape
+        # This mask indicates valid positions in the projected embeddings
+        speech_inputs["input_features_mask"] = torch.arange(max(audio_embed_sizes)).view(1, -1) < torch.tensor(
+            audio_embed_sizes
+        ).view(-1, 1)
+
+        return speech_inputs
 
     def _extract_mel_spectrograms(
         self,
@@ -872,29 +890,37 @@ class GraniteSpeechFeatureExtractor:
             Mel features of shape (batch, mel_seq_len, num_features=160)
             Note: num_features = n_mels * 2 due to stacking
         """
-        # TODO: Step 1 - Apply mel filterbank transform
-        # mel = self.mel_filters(audio.float())
+        # Move mel filters and audio to device
+        if device is not None:
+            melspec = self.mel_filters.to(device)
+            audio = audio.to(device)
+        else:
+            melspec = self.mel_filters
 
-        # TODO: Step 2 - Convert to log-mel and normalize
-        # logmel = mel.transpose(-1, -2).clip_(min=1e-10).log10_()
-        # mx = logmel.amax(dim=(-2, -1), keepdim=True)
-        # logmel = torch.maximum(logmel, mx - 8.0).div_(4).add_(1)
+        bsz = audio.shape[0]
 
-        # TODO: Step 3 - Remove last frame if odd number of frames
-        # if logmel.shape[1] % 2 == 1:
-        #     logmel = logmel[:, :-1]
+        with torch.no_grad():
+            # Step 1: Apply mel filterbank transform
+            mel = melspec(audio.float())
 
-        # TODO: Step 4 - Stack and skip by 2 (HF implementation detail)
-        # This creates 160-dim features from 80 mel bins by stacking pairs
-        # audio_features = logmel.reshape(batch, -1, 2 * n_mels)
+            # Step 2: Convert to log-mel and normalize
+            logmel = mel.transpose(-1, -2).clip_(min=1e-10).log10_()
+            mx = logmel.amax(dim=(-2, -1), keepdim=True)
+            logmel = torch.maximum(logmel, mx - 8.0).div_(4).add_(1)
 
-        logger.warning("_extract_mel_spectrograms not implemented")
-        return None
+            # Step 3: Remove last frame if odd number of frames
+            if logmel.shape[1] % 2 == 1:
+                logmel = logmel[:, :-1]
+
+            # Step 4: Stack and skip by 2 (creates 160-dim features from 80 mel bins)
+            audio_features = logmel.reshape(bsz, -1, 2 * logmel.shape[-1])
+
+        return audio_features
 
     def _get_num_audio_features(
         self,
         audio_lengths: Sequence[int]
-    ) -> Sequence[int]:
+    ) -> list[int]:
         """
         Calculate number of audio features after projection.
 
@@ -909,45 +935,74 @@ class GraniteSpeechFeatureExtractor:
             audio_lengths: Sequence of raw audio lengths (in samples)
 
         Returns:
-            Sequence of projected feature lengths
+            List of projected feature lengths
         """
-        # TODO: Implement length calculation matching HF:
-        # mel_length = raw_length // hop_length + 1
-        # encoder_length = mel_length // 2  (due to stacking)
-        # nblocks = math.ceil(encoder_length / projector_window_size)
-        # projector_length = nblocks * (projector_window_size // projector_downsample_rate)
+        effective_window_size = self.projector_window_size // self.projector_downsample_rate
 
-        logger.warning("_get_num_audio_features not implemented")
-        return []
+        projector_lengths = []
+        for raw_length in audio_lengths:
+            # Mel sequence length computation
+            mel_length = raw_length // self.hop_length + 1
+            # Encoder frame takes two mel features
+            encoder_length = mel_length // 2
+            # Number of blocks in projector
+            nblocks = math.ceil(encoder_length / self.projector_window_size)
+            # Projector output length
+            projector_length = nblocks * effective_window_size
+            projector_lengths.append(projector_length)
+
+        return projector_lengths
 
     def _get_audios_and_audio_lengths(
         self,
-        audios: Union[torch.Tensor, Sequence[torch.Tensor]]
-    ) -> Tuple[torch.Tensor, Sequence[int]]:
+        audios: Union[torch.Tensor, Sequence[torch.Tensor], np.ndarray, Sequence[np.ndarray]]
+    ) -> Tuple[torch.Tensor, list[int]]:
         """
         Validate and batch audio inputs, extracting lengths.
 
         Reference: HF GraniteSpeechFeatureExtractor._get_audios_and_audio_lengths
 
         Args:
-            audios: Raw audio as tensor or sequence of tensors
+            audios: Raw audio as tensor(s) or numpy array(s)
 
         Returns:
             Tuple of (batched_audio, audio_lengths)
+                - batched_audio: Padded audio tensor of shape (batch, max_audio_len)
+                - audio_lengths: List of original audio lengths
         """
-        # TODO: Step 1 - Handle different input formats
-        # - Single tensor: (audio_len,) or (batch, audio_len)
-        # - List of tensors: [(audio_len1,), (audio_len2,), ...]
-        # - Numpy arrays: convert to torch tensors
+        # Step 1: Coerce to PyTorch tensors if we have numpy arrays
+        if isinstance(audios, np.ndarray):
+            audios = torch.from_numpy(audios)
+        elif isinstance(audios, Sequence) and len(audios) > 0 and isinstance(audios[0], np.ndarray):
+            audios = [torch.from_numpy(arr) for arr in audios]
 
-        # TODO: Step 2 - Extract audio lengths before padding
-        # lengths = [audio.shape[-1] for audio in audios]
+        # Step 2: Handle different tensor formats
+        if isinstance(audios, torch.Tensor):
+            if audios.ndim == 1:
+                audios = audios.unsqueeze(0)
+            if not torch.is_floating_point(audios):
+                raise ValueError("Invalid audio provided. Audio should be a floating point tensor")
 
-        # TODO: Step 3 - Pad sequences to same length
-        # batched_audio = torch.nn.utils.rnn.pad_sequence(...)
+            if audios.shape[0] > 1:
+                logger.warning("Audio samples are already collated; assuming they all have the same length")
+            lengths = [audios.shape[-1]] * audios.shape[0]
+            return audios, lengths
 
-        logger.warning("_get_audios_and_audio_lengths not implemented")
-        return None, []
+        elif isinstance(audios, Sequence) and len(audios) > 0 and isinstance(audios[0], torch.Tensor):
+            if not torch.is_floating_point(audios[0]):
+                raise ValueError("Invalid audio provided. Audio should be a floating point tensor")
+
+            # Step 3: Extract audio lengths before padding
+            lengths = [audio.shape[-1] for audio in audios]
+
+            # Squeeze audio to 1D if needed
+            audios = [audio.squeeze(0) if audio.ndim > 1 else audio for audio in audios]
+
+            # Step 4: Pad sequences to same length
+            audios = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
+            return audios, lengths
+
+        raise TypeError("Invalid audio provided. Audio should be one or more torch tensors or numpy arrays")
 
 
 class GraniteSpeechProcessor:
@@ -989,7 +1044,7 @@ class GraniteSpeechProcessor:
     def __call__(
         self,
         text: Union[str, list[str]],
-        audio: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+        audio: Optional[Union[torch.Tensor, list[torch.Tensor], np.ndarray, list[np.ndarray]]] = None,
         device: str = "cpu",
         **kwargs,
     ) -> dict:
@@ -998,7 +1053,7 @@ class GraniteSpeechProcessor:
 
         Args:
             text: Text prompt(s) containing audio token placeholders
-            audio: Optional raw audio waveforms
+            audio: Optional raw audio waveforms (tensor(s) or numpy array(s))
             device: Device to place tensors on
             **kwargs: Additional arguments passed to tokenizer (e.g., padding, truncation)
 
@@ -1008,36 +1063,34 @@ class GraniteSpeechProcessor:
                 - attention_mask: Attention mask for text
                 - input_features: Mel-spectrogram features (if audio provided)
                 - input_features_mask: Mask for audio features (if audio provided)
+                - audio_embed_sizes: List of audio embedding sizes (if audio provided)
         """
-        # TODO: Step 1 - Validate text input
-        # text = self._get_validated_text(text)
+        # Step 1: Validate text input
+        text = self._get_validated_text(text)
+        prompt_strings = text
 
-        # TODO: Step 2 - Process audio if provided
-        # if audio is not None:
-        #     audio_inputs = self.audio_processor(audio, device=device)
-        #     audio_embed_sizes = audio_inputs.pop("audio_embed_sizes")
-        #
-        #     # Step 3 - Expand audio placeholders in text
-        #     # Replace each <|audio|> with N copies of the token,
-        #     # where N = number of embeddings from projector for that audio
-        #     expanded_text = self._expand_audio_tokens(text, audio_embed_sizes)
-        # else:
-        #     audio_inputs = {}
-        #     expanded_text = text
+        # Step 2: Process audio if provided
+        if audio is not None:
+            # Extract audio features
+            audio_inputs = self.audio_processor(audio, device=device)
 
-        # TODO: Step 4 - Tokenize text (with expanded audio tokens)
-        # if "padding" not in kwargs:
-        #     kwargs["padding"] = True
-        # text_inputs = self.tokenizer(expanded_text, **kwargs)
+            # Get audio embedding sizes (number of tokens after projection)
+            audio_embed_sizes = audio_inputs.pop("audio_embed_sizes")
 
-        # TODO: Step 5 - Combine text and audio inputs
-        # return {**text_inputs, **audio_inputs}
+            # Step 3: Expand audio placeholders in text
+            # Replace each <|audio|> with N copies of the token,
+            # where N = number of embeddings from projector for that audio
+            prompt_strings = self._expand_audio_tokens(text, audio_embed_sizes)
+        else:
+            audio_inputs = {}
 
-        logger.warning("GraniteSpeechProcessor.__call__ not implemented - returning dummy output")
-        return {
-            "input_ids": None,
-            "attention_mask": None,
-        }
+        # Step 4: Tokenize text (with expanded audio tokens)
+        if "padding" not in kwargs:
+            kwargs["padding"] = True
+        text_inputs = self.tokenizer(prompt_strings, **kwargs)
+
+        # Step 5: Combine text and audio inputs
+        return {**text_inputs, **audio_inputs}
 
     def _expand_audio_tokens(
         self,
@@ -1060,29 +1113,25 @@ class GraniteSpeechProcessor:
         Returns:
             List of text prompts with expanded audio tokens
         """
-        # TODO: Implement expansion logic
-        # For each text sample:
-        #   1. Find <|audio|> token
-        #   2. Replace with <placeholder> * audio_embed_sizes[i]
-        #   3. Replace <placeholder> back with <|audio|>
-        # This ensures the tokenizer sees the correct number of audio tokens
+        prompt_strings = []
+        num_replaced = 0
 
-        # Example from HF:
-        # prompt_strings = []
-        # num_replaced = 0
-        # for sample in text:
-        #     while self.audio_token in sample:
-        #         sample = sample.replace(
-        #             self.audio_token,
-        #             "<placeholder>" * audio_embed_sizes[num_replaced],
-        #             1,
-        #         )
-        #         num_replaced += 1
-        #     prompt_strings.append(sample)
-        # return [s.replace("<placeholder>", self.audio_token) for s in prompt_strings]
+        for sample in text:
+            # Replace each <|audio|> token with the appropriate number of placeholders
+            while self.audio_token in sample:
+                # Replace one occurrence at a time
+                sample = sample.replace(
+                    self.audio_token,
+                    "<placeholder>" * audio_embed_sizes[num_replaced],
+                    1,  # Replace only first occurrence
+                )
+                num_replaced += 1
+            prompt_strings.append(sample)
 
-        logger.warning("_expand_audio_tokens not implemented")
-        return text
+        # Replace all placeholders with the actual audio token
+        prompt_strings = [s.replace("<placeholder>", self.audio_token) for s in prompt_strings]
+
+        return prompt_strings
 
     def _get_validated_text(
         self,
@@ -1102,7 +1151,7 @@ class GraniteSpeechProcessor:
         """
         if isinstance(text, str):
             return [text]
-        elif isinstance(text, list) and isinstance(text[0], str):
+        elif isinstance(text, list) and len(text) > 0 and isinstance(text[0], str):
             return text
         raise TypeError("Invalid text provided! Text should be a string or list of strings.")
 
