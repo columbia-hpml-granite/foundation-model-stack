@@ -342,6 +342,7 @@ class GraniteSpeech(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         past_key_values: Optional[Tuple] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass for Granite Speech.
@@ -362,10 +363,25 @@ class GraniteSpeech(nn.Module):
         Returns:
             Tuple of (logits, optional_loss, optional_past_key_values)
         """
+        # Check if inputs_embeds is provided via kwargs (from prepare_inputs_for_generation hook)
+        # This allows the generation hook to pass pre-computed embeddings
+        # Note: If inputs_embeds is in kwargs, Python may have already extracted it to the parameter
+        # So we check both the parameter and kwargs
+        if inputs_embeds is None and "inputs_embeds" in kwargs:
+            inputs_embeds = kwargs.pop("inputs_embeds")
+            # If inputs_embeds is provided via hook, ignore input_ids to avoid conflict
+            if input_ids is not None:
+                input_ids = None
+        
         # Input validation
+        # Note: input_ids can be None when inputs_embeds is provided (from generation hook)
         if input_ids is None and inputs_embeds is None:
             raise ValueError("Specify input_ids or inputs_embeds.")
+        # Only raise error if both are provided and neither is None
+        # Allow None input_ids when inputs_embeds is provided (from generation hook)
+        # This is the normal case when using prepare_inputs_for_generation hook
         if input_ids is not None and inputs_embeds is not None:
+            # Debug: This shouldn't happen when hook returns None for input_ids
             raise ValueError("input_ids and inputs_embeds are mutually exclusive.")
         if input_features is not None and inputs_embeds is not None:
             raise ValueError("input_features and inputs_embeds cannot be used together.")
@@ -426,9 +442,89 @@ class GraniteSpeech(nn.Module):
             )
     
         if use_cache:
-            return logits, loss, cache
+            # Generation expects (logits, cache) when use_cache=True
+            # Return cache only, loss is handled separately if needed
+            return logits, cache
     
         return logits, loss
+
+    def prepare_inputs_for_generation(
+        self,
+        iteration: int,
+        input_ids: torch.Tensor,
+        kwargs: dict,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Prepare inputs for generation with audio features.
+        
+        This hook is used by fms.utils.generation.generate() to handle audio
+        processing during autoregressive generation. On the first iteration,
+        audio features are processed and merged into token embeddings. On
+        subsequent iterations with caching enabled, audio processing is skipped.
+        
+        Reference: fms/models/llava_next.py:384-426
+        
+        Args:
+            iteration: Current generation iteration (0 for first/prefill step)
+            input_ids: Token IDs of shape (batch, seq_len)
+            kwargs: Dictionary containing generation parameters including:
+                - use_cache: Whether KV caching is enabled
+                - input_features: Audio features (batch, audio_len, num_features)
+                - input_features_mask: Optional mask for audio features
+                - Other forward pass parameters (attention_mask, position_ids, etc.)
+        
+        Returns:
+            Tuple of (input_ids, updated_kwargs):
+                - input_ids: Token IDs for cached steps, or None for first step
+                  with audio (inputs_embeds will be in kwargs instead)
+                - updated_kwargs: kwargs with audio-related keys removed and
+                  inputs_embeds added (for first iteration with audio)
+        """
+        # Skip audio processing for cached decoding steps
+        if kwargs.get("use_cache", False) and iteration > 0:
+            # No need to process audio data again in cached decoding stage
+            # Remove inputs_embeds from kwargs if it's still there from previous iteration
+            kwargs.pop("inputs_embeds", None)
+            return input_ids, kwargs
+        
+        # Extract audio features from kwargs
+        input_features = kwargs.pop("input_features", None)
+        input_features_mask = kwargs.pop("input_features_mask", None)
+        
+        # No audio data to process
+        if input_features is None:
+            return input_ids, kwargs
+        
+        # First iteration with audio: process and merge audio embeddings
+        # This matches the logic in forward() method
+        if input_features_mask is None:
+            input_features_mask = input_features.new_ones(
+                input_features.shape[:2], dtype=torch.bool
+            )
+        input_features_mask = input_features_mask.to(
+            device=input_features.device, dtype=torch.bool
+        )
+        
+        if input_features_mask.shape != input_features.shape[:2]:
+            raise ValueError(
+                "input_features_mask must match input_features shape "
+                f"{input_features.shape[:2]}, got {input_features_mask.shape}"
+            )
+        
+        # Get audio embeddings from encoder + projector
+        audio_embeds = self.get_audio_features(input_features)
+        
+        # Merge audio embeddings into token embeddings at audio token positions
+        inputs_embeds = self.get_merged_audio_embeddings(
+            input_ids=input_ids,
+            audio_features=audio_embeds,
+            input_features_mask=input_features_mask,
+        )
+        
+        # Put inputs_embeds in kwargs and return None for input_ids
+        # The forward() method will use inputs_embeds from kwargs when input_ids is None
+        kwargs["inputs_embeds"] = inputs_embeds
+        return None, kwargs
 
 
 # ============================================================================
