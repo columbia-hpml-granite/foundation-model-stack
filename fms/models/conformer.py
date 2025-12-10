@@ -1,13 +1,17 @@
 import logging
+import re
 from dataclasses import dataclass
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fms import models
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
-from fms.utils.config import ModelConfig
+from fms.utils import serialization
 from fms.utils.activation import str_to_activation
+from fms.utils.config import ModelConfig
 
 
 logger = logging.getLogger(__name__)
@@ -23,34 +27,31 @@ class ConformerConfig(ModelConfig):
     Args:
         num_features: Number of input audio features (default: 160 = 80 log-mel * 2 channels)
         hidden_dim: Hidden dimension for encoder layers
-        num_layers: Number of Conformer blocks (HF default: 10, actual granite-speech-3.3-8b uses 16)
+        num_layers: Number of Conformer blocks (default: 16)
         num_heads: Number of attention heads in multi-head attention
         dim_head: Dimension per attention head
-
-        conv_kernel_size: Kernel size for depthwise convolution (Granite-speech: 15)
-        conv_expansion_factor: Expansion factor for convolution module (default: 2)
-
-        feedforward_mult: Expansion multiplier for feed-forward networks (default: 4)
-
+        conv_kernel_size: Kernel size for depthwise convolution
+        conv_expansion_factor: Expansion factor for convolution module
+        feedforward_mult: Expansion multiplier for feed-forward networks
         dropout: Dropout probability applied throughout the model
-
         max_pos_emb: Maximum positional embedding distance for relative attention
         context_size: Local attention window size (sequence positions are clamped to +/- context_size)
-
-        output_dim: Output dimension after encoder (for Q-Former input)
+        output_dim: CTC output dimension for mid-layer supervision
+        use_ctc: Enable/disable mid-layer CTC output
         activation: Activation function name (default: "silu" for SiLU/Swish)
+        linear_config: Configuration for linear module selection
     """
 
-    num_features: int = 160  # Input: 80 log-mel * 2 channels (Granite-speech actual config)
+    num_features: int = 160  # Input: 80 log-mel * 2 channels
     hidden_dim: int = 1024  # Encoder hidden dimension
-    num_layers: int = 10  # Number of conformer blocks (HF default; actual granite-speech-3.3-8b uses 16)
+    num_layers: int = 16  # Number of Conformer blocks
 
     # Multi-head attention parameters
     num_heads: int = 8
     dim_head: int = 128  # Per-head dimension (8 heads * 128 = 1024 inner_dim)
 
     # Convolution module parameters
-    conv_kernel_size: int = 15  # Granite-speech uses kernel size 15
+    conv_kernel_size: int = 15
     conv_expansion_factor: int = 2
 
     # Feed-forward parameters
@@ -60,18 +61,20 @@ class ConformerConfig(ModelConfig):
     dropout: float = 0.1
 
     # Positional encoding parameters
-    max_pos_emb: int = 512  # Maximum relative position distance (Granite-speech config)
-    context_size: int = 200  # Local attention window (Granite-speech config)
+    max_pos_emb: int = 512  # Maximum relative position distance
+    context_size: int = 200  # Local attention window
 
-    # CTC output dimension (HF: output_dim)
-    # Used for mid-layer CTC auxiliary supervision
-    output_dim: int = 42  # HF default: 42 (CTC vocabulary size)
+    # CTC output dimension for mid-layer supervision
+    output_dim: int = 42  # CTC vocabulary size
 
     # Enable/disable mid-layer CTC output
-    use_ctc: bool = True  # Set to True for HF-compatible behavior
+    use_ctc: bool = True
 
     # Activation function
     activation: str = "silu"  # SiLU (Swish) activation
+
+    # Linear module configuration
+    linear_config: Optional[Mapping[str, Any]] = None
 
 
 class ConformerFeedForward(nn.Module):
@@ -79,8 +82,8 @@ class ConformerFeedForward(nn.Module):
     Feed-forward module for Conformer block.
 
     Architecture:
-        x → LayerNorm → Linear (dim → dim * mult) → Activation → Dropout →
-        Linear (dim * mult → dim) → Dropout → output
+        x -> LayerNorm -> Linear (dim -> dim * mult) -> Activation -> Dropout ->
+        Linear (dim * mult -> dim) -> Dropout -> output
 
     Args:
         dim: Input and output dimension
@@ -104,7 +107,7 @@ class ConformerFeedForward(nn.Module):
         # Layer normalization
         self.norm = nn.LayerNorm(dim)
 
-        # Linear projection: dim → dim * mult
+        # Linear projection: dim -> dim * mult
         self.fc1 = nn.Linear(dim, dim * mult)
 
         # Activation function
@@ -113,7 +116,7 @@ class ConformerFeedForward(nn.Module):
         # Dropout
         self.dropout1 = nn.Dropout(dropout)
 
-        # Linear projection: dim * mult → dim
+        # Linear projection: dim * mult -> dim
         self.fc2 = nn.Linear(dim * mult, dim)
 
         # Dropout
@@ -129,7 +132,7 @@ class ConformerFeedForward(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        # x → LayerNorm → Linear → Activation → Dropout → Linear → Dropout
+        # x -> LayerNorm -> Linear -> Activation -> Dropout -> Linear -> Dropout
         x = self.norm(x)
         x = self.fc1(x)
         x = self.activation(x)
@@ -261,14 +264,14 @@ class ConformerConvModule(nn.Module):
     Convolution module for Conformer block.
 
     Architecture (from HuggingFace implementation):
-        x → LayerNorm →
-        Pointwise Conv (expansion) →
-        GLU →
-        Depthwise Conv →
-        BatchNorm →
-        Activation (SiLU) →
-        Pointwise Conv (compression) →
-        Dropout → output
+        x -> LayerNorm ->
+        Pointwise Conv (expansion) ->
+        GLU ->
+        Depthwise Conv ->
+        BatchNorm ->
+        Activation (SiLU) ->
+        Pointwise Conv (compression) ->
+        Dropout -> output
 
     Uses depthwise separable convolution for efficiency:
         - Pointwise conv for channel mixing
@@ -300,7 +303,7 @@ class ConformerConvModule(nn.Module):
         # Layer normalization
         self.norm = nn.LayerNorm(dim)
 
-        # Pointwise convolution (expansion): dim → dim * expansion_factor * 2 (for GLU)
+        # Pointwise convolution (expansion): dim -> dim * expansion_factor * 2 (for GLU)
         # We use *2 because GLU splits the channels in half
         self.pointwise_conv1 = nn.Conv1d(
             dim,
@@ -330,7 +333,7 @@ class ConformerConvModule(nn.Module):
         # Activation (SiLU)
         self.activation = str_to_activation(activation)
 
-        # Pointwise convolution (compression): dim * expansion_factor → dim
+        # Pointwise convolution (compression): dim * expansion_factor -> dim
         self.pointwise_conv2 = nn.Conv1d(
             dim * expansion_factor,
             dim,
@@ -355,7 +358,7 @@ class ConformerConvModule(nn.Module):
         # Apply layer normalization
         x = self.norm(x)
 
-        # Transpose for Conv1d: (batch, seq_len, dim) → (batch, dim, seq_len)
+        # Transpose for Conv1d: (batch, seq_len, dim) -> (batch, dim, seq_len)
         x = x.transpose(1, 2)
 
         # Pointwise expansion
@@ -377,7 +380,7 @@ class ConformerConvModule(nn.Module):
         # Pointwise compression
         x = self.pointwise_conv2(x)  # (batch, dim, seq_len)
 
-        # Transpose back: (batch, dim, seq_len) → (batch, seq_len, dim)
+        # Transpose back: (batch, dim, seq_len) -> (batch, seq_len, dim)
         x = x.transpose(1, 2)
 
         # Dropout
@@ -386,21 +389,16 @@ class ConformerConvModule(nn.Module):
         return x
 
 
-# ============================================================================
-# Conformer Block
-# ============================================================================
-
-
 class ConformerBlock(nn.Module):
     """
     Single Conformer block combining feed-forward, attention, and convolution.
 
     Architecture (Conformer paper):
-        x → [FF1 with 0.5x residual] →
-        [Attention with 1.0x residual] →
-        [Conv with 1.0x residual] →
-        [FF2 with 0.5x residual] →
-        LayerNorm → output
+        x -> [FF1 with 0.5x residual] ->
+        [Attention with 1.0x residual] ->
+        [Conv with 1.0x residual] ->
+        [FF2 with 0.5x residual] ->
+        LayerNorm -> output
 
     Key features:
         - Half-step residual connections for feed-forward modules (0.5x scaling)
@@ -487,34 +485,19 @@ class ConformerBlock(nn.Module):
         return x
 
 
-# ============================================================================
-# Conformer Encoder (Full Model)
-# ============================================================================
-
-
 class ConformerEncoder(nn.Module):
     """
     Full Conformer encoder for acoustic modeling.
 
-    Architecture:
-        Audio Features (batch, seq_len, num_features=80) →
-        Input Projection (80 → hidden_dim) →
-        Conformer Block 1 → ... → Conformer Block N →
-        Output (batch, seq_len, hidden_dim)
-
-    Key features:
-        - Processes variable-length audio sequences
-        - No temporal downsampling in Conformer blocks (Q-Former handles downsampling)
-        - Precomputes relative position distances for all blocks
-        - Shaw's relative positional embeddings for attention
+    Processes audio features through a stack of Conformer blocks with optional mid-layer
+    CTC supervision. Uses Shaw's relative positional embeddings for attention.
 
     Args:
         config: ConformerConfig with all hyperparameters
-        distributed_strategy: Strategy for distributed training (default: NoOpStrategy)
+        distributed_strategy: Strategy for distributed training
 
     Input:
         input_features: Audio features of shape (batch, seq_len, num_features)
-                       Typically 80 log-mel filterbank features
 
     Output:
         hidden_states: Acoustic embeddings of shape (batch, seq_len, hidden_dim)
@@ -522,35 +505,46 @@ class ConformerEncoder(nn.Module):
 
     def __init__(
         self,
-        config: ConformerConfig,
+        config: Optional[ConformerConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
+        **kwargs,
     ):
         super().__init__()
-        self.config = config
+        if config is not None:
+            self.config = config
+        else:
+            self.config = ConformerConfig()
+        self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
 
-        # 1. Input projection: num_features → hidden_dim
-        self.input_proj = nn.Linear(config.num_features, config.hidden_dim)
+        # Input projection: num_features -> hidden_dim
+        self.input_proj = nn.Linear(self.config.num_features, self.config.hidden_dim)
 
-        # 2. Stack of Conformer blocks (num_layers)
+        # Stack of Conformer blocks
         self.blocks = nn.ModuleList([
-            ConformerBlock(config) for _ in range(config.num_layers)
+            ConformerBlock(self.config) for _ in range(self.config.num_layers)
         ])
 
-        # 3. CTC output layers (HF-aligned: mid-layer CTC supervision)
-        # Reference: HF modeling_granite_speech.py:265-278
-        if config.use_ctc:
-            # out: projects hidden_dim → output_dim (CTC logits)
-            self.out = nn.Linear(config.hidden_dim, config.output_dim)
-            # out_mid: projects output_dim → hidden_dim (feedback to encoder)
-            self.out_mid = nn.Linear(config.output_dim, config.hidden_dim)
+        # CTC output layers for mid-layer supervision
+        if self.config.use_ctc:
+            # out: projects hidden_dim -> output_dim (CTC logits)
+            self.out = nn.Linear(self.config.hidden_dim, self.config.output_dim)
+            # out_mid: projects output_dim -> hidden_dim (feedback to encoder)
+            self.out_mid = nn.Linear(self.config.output_dim, self.config.hidden_dim)
         else:
             self.out = None
             self.out_mid = None
 
-        # 4. Register buffer for attention_dists (precomputed relative positions)
+        # Precompute relative position distances for attention
         attention_dists = self._precompute_attention_dists(max_seq_len=5000)
         self.register_buffer("attention_dists", attention_dists)
+
+    @classmethod
+    def from_config(cls, config: ConformerConfig) -> "ConformerEncoder":
+        return cls(config)
+
+    def get_config(self) -> ConformerConfig:
+        return self.config
 
     def _precompute_attention_dists(self, max_seq_len: int = 5000) -> torch.Tensor:
         """
@@ -607,7 +601,7 @@ class ConformerEncoder(nn.Module):
             f"config.num_features {self.config.num_features}"
         )
 
-        # 2. Project input: (batch, seq_len, num_features) → (batch, seq_len, hidden_dim)
+        # 2. Project input: (batch, seq_len, num_features) -> (batch, seq_len, hidden_dim)
         x = self.input_proj(input_features)
 
         # 3. Extract attention_dists for current sequence length
@@ -635,84 +629,143 @@ class ConformerEncoder(nn.Module):
         return x
 
 
-# ============================================================================
-# Model Registration (for FMS model registry)
-# ============================================================================
+_architecture_name = "conformer"
+_default_config = ConformerConfig()
 
 
-def _create_conformer_config(
-    num_features: int = 80,
-    hidden_dim: int = 1024,
-    num_layers: int = 10,
-    num_heads: int = 8,
-    dim_head: int = 64,
-    **kwargs,
-) -> ConformerConfig:
+def _conformer_factory_factory(config):
+    def factory(**kwargs):
+        return ConformerEncoder(config, **kwargs)
+    return factory
+
+
+models.register_model(
+    _architecture_name,
+    "granite_speech",
+    _conformer_factory_factory(_default_config),
+)
+
+
+def _hf_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]:
     """
-    Factory function for creating Conformer configurations.
+    Convert HuggingFace Conformer weight names to FMS format.
+
+    Maps encoder weights from HF naming convention to FMS naming convention.
+    This enables loading pretrained HF Conformer checkpoints into FMS models.
+
+    HF Structure (from granite-speech encoder):
+        encoder.input_linear -> input projection
+        encoder.layers.{i} -> conformer blocks
+        encoder.layers.{i}.ff1 -> first feed-forward
+        encoder.layers.{i}.attn -> attention module
+        encoder.layers.{i}.conv -> convolution module
+        encoder.layers.{i}.ff2 -> second feed-forward
+        encoder.out -> CTC output layer
+        encoder.out_mid -> CTC feedback layer
+
+    FMS Structure:
+        input_proj -> input projection
+        blocks.{i} -> conformer blocks
+        blocks.{i}.ff1 -> first feed-forward
+        blocks.{i}.attn -> attention module
+        blocks.{i}.conv -> convolution module
+        blocks.{i}.ff2 -> second feed-forward
+        out -> CTC output layer
+        out_mid -> CTC feedback layer
 
     Args:
-        num_features: Number of input audio features
-        hidden_dim: Hidden dimension
-        num_layers: Number of Conformer blocks
-        num_heads: Number of attention heads
-        dim_head: Dimension per attention head
-        **kwargs: Additional config parameters
+        input_sd: Input state dict with HF weight names
+        **kwargs: Additional arguments (unused)
 
     Returns:
-        ConformerConfig instance
+        State dict with FMS weight names
     """
-    return ConformerConfig(
-        num_features=num_features,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        dim_head=dim_head,
-        **kwargs,
-    )
+    replacements = [
+        # Input projection layer
+        (r"^encoder\.input_linear\.", "input_proj."),
+
+        # Layer index: HF uses 'layers', FMS uses 'blocks'
+        (r"^encoder\.layers\.(\d+)\.", r"blocks.\1."),
+
+        # Feed-forward modules (ff1 and ff2)
+        (r"\.ff1\.pre_norm\.", ".ff1.norm."),
+        (r"\.ff1\.up_proj\.", ".ff1.fc1."),
+        (r"\.ff1\.down_proj\.", ".ff1.fc2."),
+        (r"\.ff2\.pre_norm\.", ".ff2.norm."),
+        (r"\.ff2\.up_proj\.", ".ff2.fc1."),
+        (r"\.ff2\.down_proj\.", ".ff2.fc2."),
+
+        # Attention module
+        (r"\.attn\.pre_norm\.", ".attn.norm."),
+        (r"\.attn\.to_q\.", ".attn.to_q."),
+        (r"\.attn\.to_k\.", ".attn.to_k."),
+        (r"\.attn\.to_v\.", ".attn.to_v."),
+        (r"\.attn\.to_out\.", ".attn.to_out."),
+        (r"\.attn\.rel_pos_emb\.", ".attn.pos_emb."),
+
+        # Convolution module
+        (r"\.conv\.pre_norm\.", ".conv.norm."),
+        (r"\.conv\.up_conv\.", ".conv.pointwise_conv1."),
+        (r"\.conv\.depth_conv\.conv\.", ".conv.depthwise_conv."),
+        (r"\.conv\.down_conv\.", ".conv.pointwise_conv2."),
+        (r"\.conv\.batch_norm\.", ".conv.batch_norm."),
+
+        # Post normalization
+        (r"\.post_norm\.", ".post_norm."),
+
+        # CTC layers (mid-layer supervision)
+        (r"^encoder\.out\.", "out."),
+        (r"^encoder\.out_mid\.", "out_mid."),
+    ]
+
+    new_sd = {}
+    for name, param in input_sd.items():
+        new_name = name
+        for pattern, repl in replacements:
+            new_name = re.sub(pattern, repl, new_name)
+        new_sd[new_name] = param
+
+    return new_sd
 
 
-# Predefined configurations for common variants
-CONFORMER_CONFIGS = {
-    "granite_speech_10L_1024H": _create_conformer_config(
-        num_features=80,
-        hidden_dim=1024,
-        num_layers=10,
-        num_heads=8,
-        dim_head=64,
-        conv_kernel_size=31,
-        feedforward_mult=4,
-        dropout=0.1,
-    ),
-    "granite_speech_16L_1024H": _create_conformer_config(
-        num_features=80,
-        hidden_dim=1024,
-        num_layers=16,
-        num_heads=8,
-        dim_head=64,
-        conv_kernel_size=31,
-        feedforward_mult=4,
-        dropout=0.1,
-    ),
-    "conformer_small_12L_512H": _create_conformer_config(
-        num_features=80,
-        hidden_dim=512,
-        num_layers=12,
-        num_heads=8,
-        dim_head=64,
-        conv_kernel_size=31,
-        feedforward_mult=4,
-        dropout=0.1,
-    ),
-}
+def _weight_fusion(
+    input_sd: Mapping[str, Any],
+    model_config: Optional[ConformerConfig] = None,
+    **kwargs
+) -> Mapping[str, Any]:
+    """
+    Weight fusion adapter for Conformer.
+
+    Note: Conformer doesn't use fused attention/MLP weights like decoder models
+    (e.g., Granite, LLaMA). The Conformer architecture uses separate Q, K, V
+    projections and doesn't benefit from the same fusion optimizations.
+
+    This is a pass-through function for consistency with the FMS adapter pattern.
+
+    Args:
+        input_sd: Input state dict
+        model_config: Optional Conformer config (unused)
+        **kwargs: Additional arguments (unused)
+
+    Returns:
+        Unmodified state dict
+    """
+    # Conformer uses standard attention without weight fusion
+    return input_sd
 
 
-# TODO: Register with FMS model registry
-# from fms import models
-# _architecture_name = "conformer"
-# for variant_name, config in CONFORMER_CONFIGS.items():
-#     models.register_model(
-#         _architecture_name,
-#         variant_name,
-#         lambda c=config: ConformerEncoder(c)
-#     )
+# Register serialization adapter steps
+serialization.register_adapter_step(
+    _architecture_name, "hf_to_fms_names", _hf_to_fms_names
+)
+
+serialization.register_adapter_step(
+    _architecture_name, "weight_fusion", _weight_fusion
+)
+
+# Register complete HF adapter (defines the pipeline: name conversion -> fusion)
+serialization.register_adapter(
+    _architecture_name,
+    "hf",
+    ["hf_to_fms_names", "weight_fusion"],
+)
