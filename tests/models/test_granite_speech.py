@@ -93,6 +93,19 @@ class GraniteSpeechFixtures(ConfigFixtureMixin, ModelFixtureMixin):
     This will include the config and model signatures.
     """
 
+    def _maybe_get_initialized_parameter(self, key: str, parameter: torch.Tensor):
+        """
+        Override to handle non-float parameters (like attention_dists buffer).
+
+        The base class uses torch.randn_like which doesn't work for Long tensors.
+        For integer buffers, we return the parameter unchanged.
+        """
+        # Skip initialization for integer/long tensors (buffers like attention_dists)
+        if parameter.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+            return parameter
+        # For float tensors, return None to use default random initialization
+        return None
+
     @pytest.fixture(scope="class", autouse=True)
     def uninitialized_model(self, config: GraniteSpeechConfig):
         return GraniteSpeech(config)
@@ -207,6 +220,12 @@ class GraniteSpeechForConditionalGenerationModelTester:
 
     Migrated from HF test_modeling_granite_speech.py L55-211.
     Adapted for FMS GraniteSpeech model.
+
+    HF Reference parameters (L56-143):
+    - encoder_config: context_size=200, hidden_dim=32, input_dim=160, num_heads=4, num_layers=2, output_dim=42
+    - text_config: vocab_size=99, hidden_size=32, num_hidden_layers=2, num_attention_heads=4, intermediate_size=37
+    - projector_config: encoder_hidden_size=32, hidden_size=32, num_hidden_layers=2, num_attention_heads=4, intermediate_size=256
+    - sequence_dim=844, feature_dim=160, batch_size=3, num_audio_tokens=2
     """
 
     def __init__(
@@ -219,54 +238,55 @@ class GraniteSpeechForConditionalGenerationModelTester:
         downsample_rate=5,
         window_size=15,
     ):
-        # Encoder config (Conformer)
+        # Encoder config (Conformer) - matches HF encoder_config L60-73
         self.encoder_config = encoder_config or ConformerConfig(
-            num_features=160,
-            hidden_dim=32,
-            num_layers=2,
-            num_heads=4,
-            dim_head=32,
-            conv_kernel_size=15,
-            conv_expansion_factor=2,
-            feedforward_mult=4,
-            dropout=0.1,
-            output_dim=42,
+            num_features=160,       # HF: input_dim=160
+            hidden_dim=32,          # HF: hidden_dim=32
+            num_layers=2,           # HF: num_layers=2
+            num_heads=4,            # HF: num_heads=4
+            dim_head=32,            # HF: dim_head=32
+            conv_kernel_size=15,    # HF: conv_kernel_size=15
+            conv_expansion_factor=2,# HF: conv_expansion_factor=2
+            feedforward_mult=4,     # HF: feedforward_mult=4
+            dropout=0.1,            # HF: dropout=0.1
+            output_dim=42,          # HF: output_dim=42
         )
 
-        # Decoder config (Granite)
+        # Decoder config (Granite) - matches HF text_config L74-95
         self.decoder_config = decoder_config or GraniteConfig(
-            src_vocab_size=99,
-            emb_dim=32,
-            nlayers=2,
-            nheads=4,
-            hidden_grow_factor=37 / 32,
-            max_expected_seq_len=580,
-            pad_id=1,
+            src_vocab_size=99,              # HF: vocab_size=99
+            emb_dim=32,                     # HF: hidden_size=32
+            nlayers=2,                      # HF: num_hidden_layers=2
+            nheads=4,                       # HF: num_attention_heads=4
+            hidden_grow_factor=37 / 32,     # HF: intermediate_size=37
+            max_expected_seq_len=580,       # HF: max_position_embeddings=580
+            pad_id=1,                       # HF: pad_token_id=1
         )
 
-        # Projector config (SpeechProjector)
+        # Projector config (SpeechProjector) - matches HF projector_config L96-112
         self.projector_config = projector_config or SpeechProjectorConfig(
-            encoder_dim=32,
-            decoder_dim=32,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            intermediate_size=256,
-            window_size=window_size,
-            downsample_rate=downsample_rate,
+            encoder_dim=32,                 # HF: encoder_hidden_size=32
+            decoder_dim=32,                 # HF: hidden_size=32
+            num_hidden_layers=2,            # HF: num_hidden_layers=2
+            num_attention_heads=4,          # HF: num_attention_heads=4
+            intermediate_size=256,          # HF: intermediate_size=256
+            window_size=window_size,        # HF: window_size=15 (from parent config)
+            downsample_rate=downsample_rate,# HF: downsample_rate=5 (from parent config)
+            num_queries=window_size // downsample_rate,  # Derived: 15 // 5 = 3
         )
 
-        self.audio_token_index = audio_token_index
-        self.downsample_rate = downsample_rate
-        self.window_size = window_size
+        self.audio_token_index = audio_token_index  # HF: audio_token_index=0
+        self.downsample_rate = downsample_rate      # HF: downsample_rate=5
+        self.window_size = window_size              # HF: window_size=15
 
-        # Dims for audio features
-        self.sequence_dim = 844
-        self.feature_dim = 160
-        self.batch_size = 3
-        self.pad_token_id = 1
-        self.seq_len = 7
-        self.num_audio_tokens = 2
-        self.seq_length = seq_length + self.num_audio_tokens
+        # Dims for audio features - matches HF L133-143
+        self.sequence_dim = 844             # HF: sequence_dim=844
+        self.feature_dim = 160              # HF: feature_dim=160
+        self.batch_size = 3                 # HF: batch_size=3
+        self.pad_token_id = 1               # HF: pad_token_id from text_config
+        self.seq_len = seq_length           # HF: seq_len=7
+        self.num_audio_tokens = 2           # HF: num_audio_tokens=2
+        self.seq_length = seq_length + self.num_audio_tokens  # HF: seq_length=9
 
     def get_config(self) -> GraniteSpeechConfig:
         """Create a GraniteSpeechConfig for testing."""
@@ -338,7 +358,8 @@ class TestGraniteSpeechModel:
         # Don't use input_features for this test
 
         # Get input embeddings
-        wte = model.decoder.model.embedding
+        # FMS GraniteHeadless has embedding directly, not via .model
+        wte = model.decoder.embedding
         inputs_embeds = wte(input_ids)
 
         with torch.no_grad():
@@ -357,6 +378,9 @@ class TestGraniteSpeechModel:
         encoder as well.
 
         HF Source: test_modeling_granite_speech.py L252-287
+        Note: HF test doesn't run a forward pass with audio - it only checks
+        attention implementation attributes. Our test verifies model creation
+        and forward pass with correctly matched dimensions.
         """
         config, inputs_dict = model_tester.prepare_config_and_inputs_for_common()
         model = GraniteSpeech(config)
@@ -367,7 +391,24 @@ class TestGraniteSpeechModel:
         model.to(torch_device)
         model.eval()
 
-        input_ids = inputs_dict["input_ids"].to(torch_device)
+        # For forward pass test, we need audio tokens count to match projected features
+        # With sequence_dim=844, window_size=15, num_queries=3:
+        # num_windows = 844 // 15 = 56, num_audio_tokens = 56 * 3 = 168
+        window_size = model_tester.window_size
+        num_queries = model_tester.projector_config.num_queries
+        num_windows = model_tester.sequence_dim // window_size
+        actual_num_audio_tokens = num_windows * num_queries
+
+        # Create input_ids with correct number of audio tokens
+        batch_size = model_tester.batch_size
+        seq_length = model_tester.seq_len + actual_num_audio_tokens
+        input_ids = torch.randint(
+            2, config.decoder_config.src_vocab_size,
+            (batch_size, seq_length), device=torch_device
+        )
+        # Place audio tokens at the beginning
+        input_ids[:, :actual_num_audio_tokens] = config.audio_token_index
+
         input_features = inputs_dict["input_features"].to(torch_device)
 
         with torch.no_grad():
