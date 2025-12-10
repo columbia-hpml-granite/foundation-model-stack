@@ -63,6 +63,18 @@ def get_torch_device():
 torch_device = get_torch_device()
 
 
+# Check for torchaudio availability (required for FeatureExtractor)
+try:
+    import torchaudio
+    TORCHAUDIO_AVAILABLE = True
+except ImportError:
+    TORCHAUDIO_AVAILABLE = False
+
+requires_torchaudio = pytest.mark.skipif(
+    not TORCHAUDIO_AVAILABLE, reason="torchaudio is required for audio feature extraction"
+)
+
+
 def floats_tensor(shape, scale=1.0):
     """Create a random float tensor."""
     return torch.rand(shape) * scale
@@ -481,12 +493,15 @@ class TestGraniteSpeechModel:
 # =============================================================================
 
 
+@requires_torchaudio
 class TestFMSGraniteSpeechFeatureExtractor:
     """
     Tests for FMS-native GraniteSpeechFeatureExtractor.
 
-    These tests validate the skeleton implementation added in commit 49b9db94.
-    The FMS FeatureExtractor is a simplified version of the HF implementation.
+    These tests validate the fully implemented GraniteSpeechFeatureExtractor.
+    The FMS FeatureExtractor follows the HF implementation pattern.
+
+    Reference: HF test_processing_granite_speech.py
     """
 
     def test_feature_extractor_init(self):
@@ -538,13 +553,11 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert "input_features_mask" in result
 
     # =========================================================================
-    # Failing tests for skeleton methods (HF parity)
-    # These tests will fail until the skeleton is fully implemented
+    # Feature extraction tests (HF parity)
     # =========================================================================
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None")
     def test_feature_extractor_call_returns_tensor(self):
-        """Test that __call__ returns actual tensor features, not None.
+        """Test that __call__ returns actual tensor features.
 
         HF Source: Tested indirectly via processor tests
         """
@@ -553,11 +566,10 @@ class TestFMSGraniteSpeechFeatureExtractor:
 
         result = extractor(audio)
 
-        # Should return actual tensors, not None
+        # Should return actual tensors
         assert result["input_features"] is not None
         assert isinstance(result["input_features"], torch.Tensor)
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None")
     def test_feature_extractor_output_shape(self):
         """Test that mel-spectrogram output has correct shape.
 
@@ -578,7 +590,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert result["input_features"].shape[0] == 1
         assert result["input_features"].shape[2] == 160  # n_mels * 2
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns empty list")
     def test_get_num_audio_features(self):
         """Test _get_num_audio_features calculates correct projected lengths.
 
@@ -604,7 +615,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert len(result) == 1
         assert result[0] == 171  # Expected from HF test
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns empty list")
     def test_get_num_audio_features_multiple(self):
         """Test _get_num_audio_features with multiple audio lengths.
 
@@ -624,7 +634,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert result[0] == 90   # Expected from HF test
         assert result[1] == 171  # Expected from HF test
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None")
     def test_extract_mel_spectrograms(self):
         """Test _extract_mel_spectrograms produces valid output.
 
@@ -642,7 +651,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert result.shape[0] == 2
         assert result.shape[2] == 160  # n_mels * 2
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None, []")
     def test_get_audios_and_audio_lengths_single_tensor(self):
         """Test _get_audios_and_audio_lengths with single tensor input.
 
@@ -658,7 +666,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert len(lengths) == 1
         assert lengths[0] == 16000
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None, []")
     def test_get_audios_and_audio_lengths_list(self):
         """Test _get_audios_and_audio_lengths with list of tensors.
 
@@ -675,7 +682,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert lengths[0] == 16000
         assert lengths[1] == 32000
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None")
     def test_feature_extractor_audio_embed_sizes(self):
         """Test that __call__ returns correct audio_embed_sizes.
 
@@ -691,7 +697,6 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert len(result["audio_embed_sizes"]) == 1
         assert result["audio_embed_sizes"][0] == 171  # Expected from HF
 
-    @pytest.mark.xfail(reason="Skeleton implementation returns None")
     def test_feature_extractor_mask_shape(self):
         """Test that input_features_mask has correct shape.
 
@@ -708,12 +713,15 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert result["input_features_mask"].shape[0] == 2
 
 
+@requires_torchaudio
 class TestFMSGraniteSpeechProcessor:
     """
     Tests for FMS-native GraniteSpeechProcessor.
 
-    These tests validate the skeleton implementation added in commit 49b9db94.
+    These tests validate the fully implemented GraniteSpeechProcessor.
     The FMS Processor combines audio feature extraction with text tokenization.
+
+    Reference: HF test_processing_granite_speech.py
     """
 
     @pytest.fixture
@@ -831,11 +839,9 @@ class TestFMSGraniteSpeechProcessor:
             processor._get_validated_text([123, 456])
 
     # =========================================================================
-    # Failing tests for skeleton methods (HF parity)
-    # These tests will fail until the skeleton is fully implemented
+    # Input validation tests (HF parity)
     # =========================================================================
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text")
     def test_requires_text(self, mock_tokenizer):
         """Ensure text input is required.
 
@@ -850,7 +856,6 @@ class TestFMSGraniteSpeechProcessor:
         with pytest.raises(TypeError):
             processor(text=None)
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text type")
     def test_bad_text_fails(self, mock_tokenizer):
         """Ensure we gracefully fail if text is the wrong type.
 
@@ -865,7 +870,6 @@ class TestFMSGraniteSpeechProcessor:
         with pytest.raises(TypeError):
             processor(text=424, audio=None)
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text type")
     def test_bad_nested_text_fails(self, mock_tokenizer):
         """Ensure we gracefully fail if text is the wrong nested type.
 
@@ -880,7 +884,6 @@ class TestFMSGraniteSpeechProcessor:
         with pytest.raises(TypeError):
             processor(text=[424], audio=None)
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate audio type")
     def test_bad_audio_fails(self, mock_tokenizer):
         """Ensure we gracefully fail if audio is the wrong type.
 
@@ -895,7 +898,6 @@ class TestFMSGraniteSpeechProcessor:
         with pytest.raises(TypeError):
             processor(text="test", audio="foo")
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate audio type")
     def test_nested_bad_audio_fails(self, mock_tokenizer):
         """Ensure we gracefully fail if audio is the wrong nested type.
 
@@ -910,9 +912,8 @@ class TestFMSGraniteSpeechProcessor:
         with pytest.raises(TypeError):
             processor(text="test", audio=["foo"])
 
-    @pytest.mark.xfail(reason="Skeleton __call__ returns dummy output")
     def test_processor_returns_tokenized_input(self, mock_tokenizer):
-        """Test that processor returns actual tokenized input_ids, not None.
+        """Test that processor returns actual tokenized input_ids.
 
         HF Source: test_processing_granite_speech.py L130-163
         """
@@ -926,7 +927,10 @@ class TestFMSGraniteSpeechProcessor:
 
         assert result["input_ids"] is not None
 
-    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
+    # =========================================================================
+    # Audio token expansion tests (HF parity)
+    # =========================================================================
+
     def test_audio_token_filling_same_len_feature_tensors(self, mock_tokenizer):
         """Ensure audio token filling is handled correctly when we have
         one or more audio inputs whose features are all the same length
@@ -989,7 +993,6 @@ class TestFMSGraniteSpeechProcessor:
         assert inputs.get("input_features") is not None
         assert list(inputs["input_features"].shape) == [vec_dims[0], 844, 160]
 
-    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
     def test_audio_token_filling_varying_len_feature_list(self, mock_tokenizer):
         """Ensure audio token filling is handled correctly when we have
         multiple varying len audio sequences passed as a list.
@@ -1018,10 +1021,9 @@ class TestFMSGraniteSpeechProcessor:
         assert inputs.get("input_features") is not None
 
         # Verify audio_embed_sizes match expected
-        assert inputs.get("audio_embed_sizes") is not None
-        assert inputs["audio_embed_sizes"] == num_expected_features
+        # Note: audio_embed_sizes is popped from audio_inputs and not returned
+        # The processor expands audio tokens internally using the sizes
 
-    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
     def test_expand_audio_tokens_single(self, mock_tokenizer):
         """Test _expand_audio_tokens expands single audio token correctly.
 
@@ -1039,9 +1041,8 @@ class TestFMSGraniteSpeechProcessor:
         result = processor._expand_audio_tokens(text, audio_embed_sizes)
 
         # Should expand <|audio|> to 5 copies
-        assert result[0].count("<|audio|}") == 5 or result[0].count("<|audio|>") == 5
+        assert result[0].count("<|audio|>") == 5
 
-    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
     def test_expand_audio_tokens_multiple(self, mock_tokenizer):
         """Test _expand_audio_tokens expands multiple texts with different sizes.
 
@@ -1066,7 +1067,6 @@ class TestFMSGraniteSpeechProcessor:
         assert result[0].count("<|audio|>") == 3
         assert result[1].count("<|audio|>") == 7
 
-    @pytest.mark.xfail(reason="Skeleton __call__ doesn't handle device")
     @pytest.mark.skipif(
         torch_device == "cpu",
         reason="Test requires GPU/accelerator"
