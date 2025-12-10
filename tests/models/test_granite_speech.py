@@ -438,6 +438,176 @@ class TestFMSGraniteSpeechFeatureExtractor:
         assert "audio_embed_sizes" in result
         assert "input_features_mask" in result
 
+    # =========================================================================
+    # Failing tests for skeleton methods (HF parity)
+    # These tests will fail until the skeleton is fully implemented
+    # =========================================================================
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None")
+    def test_feature_extractor_call_returns_tensor(self):
+        """Test that __call__ returns actual tensor features, not None.
+
+        HF Source: Tested indirectly via processor tests
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+        audio = torch.randn(1, 16000)  # 1 second at 16kHz
+
+        result = extractor(audio)
+
+        # Should return actual tensors, not None
+        assert result["input_features"] is not None
+        assert isinstance(result["input_features"], torch.Tensor)
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None")
+    def test_feature_extractor_output_shape(self):
+        """Test that mel-spectrogram output has correct shape.
+
+        Expected shape: (batch, mel_seq_len, num_features=160)
+        where num_features = n_mels * 2 = 80 * 2 = 160 (due to stacking)
+
+        HF Source: test_processing_granite_speech.py L130-163
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+
+        # 1 second of audio at 16kHz
+        audio = torch.randn(1, 16000)
+        result = extractor(audio)
+
+        assert result["input_features"] is not None
+        # Shape should be (batch=1, mel_seq_len, 160)
+        assert result["input_features"].dim() == 3
+        assert result["input_features"].shape[0] == 1
+        assert result["input_features"].shape[2] == 160  # n_mels * 2
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns empty list")
+    def test_get_num_audio_features(self):
+        """Test _get_num_audio_features calculates correct projected lengths.
+
+        The calculation should be:
+        1. mel_length = raw_length // hop_length + 1
+        2. encoder_length = mel_length // 2 (due to stacking)
+        3. nblocks = ceil(encoder_length / projector_window_size)
+        4. projector_length = nblocks * (window_size // downsample_rate)
+
+        HF Source: test_processing_granite_speech.py L130-163, L165-197
+        """
+        extractor = GraniteSpeechFeatureExtractor(
+            hop_length=160,
+            projector_window_size=15,
+            projector_downsample_rate=5,
+        )
+
+        # Test with known audio lengths from HF tests
+        # 269920 samples -> 171 projected features (from HF test)
+        audio_lengths = [269920]
+        result = extractor._get_num_audio_features(audio_lengths)
+
+        assert len(result) == 1
+        assert result[0] == 171  # Expected from HF test
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns empty list")
+    def test_get_num_audio_features_multiple(self):
+        """Test _get_num_audio_features with multiple audio lengths.
+
+        HF Source: test_processing_granite_speech.py L165-197
+        """
+        extractor = GraniteSpeechFeatureExtractor(
+            hop_length=160,
+            projector_window_size=15,
+            projector_downsample_rate=5,
+        )
+
+        # Test with varying lengths from HF test
+        audio_lengths = [142100, 269920]
+        result = extractor._get_num_audio_features(audio_lengths)
+
+        assert len(result) == 2
+        assert result[0] == 90   # Expected from HF test
+        assert result[1] == 171  # Expected from HF test
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None")
+    def test_extract_mel_spectrograms(self):
+        """Test _extract_mel_spectrograms produces valid output.
+
+        HF Source: Tested indirectly via __call__
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+        audio = torch.randn(2, 16000)  # batch of 2, 1 second each
+
+        result = extractor._extract_mel_spectrograms(audio)
+
+        assert result is not None
+        assert isinstance(result, torch.Tensor)
+        # Shape: (batch, mel_seq_len, n_mels*2)
+        assert result.dim() == 3
+        assert result.shape[0] == 2
+        assert result.shape[2] == 160  # n_mels * 2
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None, []")
+    def test_get_audios_and_audio_lengths_single_tensor(self):
+        """Test _get_audios_and_audio_lengths with single tensor input.
+
+        HF Source: Tested indirectly via __call__
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+
+        # Single audio tensor
+        audio = torch.randn(16000)  # 1 second
+        batched, lengths = extractor._get_audios_and_audio_lengths(audio)
+
+        assert batched is not None
+        assert len(lengths) == 1
+        assert lengths[0] == 16000
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None, []")
+    def test_get_audios_and_audio_lengths_list(self):
+        """Test _get_audios_and_audio_lengths with list of tensors.
+
+        HF Source: Tested indirectly via __call__
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+
+        # List of audio tensors with different lengths
+        audios = [torch.randn(16000), torch.randn(32000)]
+        batched, lengths = extractor._get_audios_and_audio_lengths(audios)
+
+        assert batched is not None
+        assert len(lengths) == 2
+        assert lengths[0] == 16000
+        assert lengths[1] == 32000
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None")
+    def test_feature_extractor_audio_embed_sizes(self):
+        """Test that __call__ returns correct audio_embed_sizes.
+
+        HF Source: test_processing_granite_speech.py L130-163
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+
+        # Audio length that produces known embed size
+        audio = torch.randn(1, 269920)
+        result = extractor(audio)
+
+        assert result["audio_embed_sizes"] is not None
+        assert len(result["audio_embed_sizes"]) == 1
+        assert result["audio_embed_sizes"][0] == 171  # Expected from HF
+
+    @pytest.mark.xfail(reason="Skeleton implementation returns None")
+    def test_feature_extractor_mask_shape(self):
+        """Test that input_features_mask has correct shape.
+
+        HF Source: test_processing_granite_speech.py L130-163
+        """
+        extractor = GraniteSpeechFeatureExtractor()
+        audio = torch.randn(2, 16000)  # batch of 2
+
+        result = extractor(audio)
+
+        assert result["input_features_mask"] is not None
+        assert isinstance(result["input_features_mask"], torch.Tensor)
+        # Mask should match input_features batch and sequence dims
+        assert result["input_features_mask"].shape[0] == 2
+
 
 class TestFMSGraniteSpeechProcessor:
     """
@@ -560,6 +730,271 @@ class TestFMSGraniteSpeechProcessor:
 
         with pytest.raises(TypeError):
             processor._get_validated_text([123, 456])
+
+    # =========================================================================
+    # Failing tests for skeleton methods (HF parity)
+    # These tests will fail until the skeleton is fully implemented
+    # =========================================================================
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text")
+    def test_requires_text(self, mock_tokenizer):
+        """Ensure text input is required.
+
+        HF Source: test_processing_granite_speech.py L73-83
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        with pytest.raises(TypeError):
+            processor(text=None)
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text type")
+    def test_bad_text_fails(self, mock_tokenizer):
+        """Ensure we gracefully fail if text is the wrong type.
+
+        HF Source: test_processing_granite_speech.py L85-92
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        with pytest.raises(TypeError):
+            processor(text=424, audio=None)
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate text type")
+    def test_bad_nested_text_fails(self, mock_tokenizer):
+        """Ensure we gracefully fail if text is the wrong nested type.
+
+        HF Source: test_processing_granite_speech.py L94-104
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        with pytest.raises(TypeError):
+            processor(text=[424], audio=None)
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate audio type")
+    def test_bad_audio_fails(self, mock_tokenizer):
+        """Ensure we gracefully fail if audio is the wrong type.
+
+        HF Source: test_processing_granite_speech.py L106-116
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        with pytest.raises(TypeError):
+            processor(text="test", audio="foo")
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't validate audio type")
+    def test_nested_bad_audio_fails(self, mock_tokenizer):
+        """Ensure we gracefully fail if audio is the wrong nested type.
+
+        HF Source: test_processing_granite_speech.py L118-128
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        with pytest.raises(TypeError):
+            processor(text="test", audio=["foo"])
+
+    @pytest.mark.xfail(reason="Skeleton __call__ returns dummy output")
+    def test_processor_returns_tokenized_input(self, mock_tokenizer):
+        """Test that processor returns actual tokenized input_ids, not None.
+
+        HF Source: test_processing_granite_speech.py L130-163
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        result = processor(text="Hello world")
+
+        assert result["input_ids"] is not None
+
+    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
+    def test_audio_token_filling_same_len_feature_tensors(self, mock_tokenizer):
+        """Ensure audio token filling is handled correctly when we have
+        one or more audio inputs whose features are all the same length
+        stacked into a tensor / numpy array.
+
+        NOTE: Currently we enforce that each sample can only have one audio.
+
+        HF Source: test_processing_granite_speech.py L130-163
+        """
+        # Create a mock tokenizer that tracks audio tokens
+        class TrackingTokenizer:
+            def __init__(self):
+                self.audio_token = "<|audio|>"
+
+            def __call__(self, text, return_tensors=None, **kwargs):
+                # Count audio tokens in text
+                if isinstance(text, str):
+                    text = [text]
+                audio_token_counts = [t.count(self.audio_token) for t in text]
+                # Return token IDs with audio_token_id = 999
+                input_ids = []
+                for t in text:
+                    ids = []
+                    for char in t.split():
+                        if char == self.audio_token:
+                            ids.append(999)
+                        else:
+                            ids.append(1)
+                    input_ids.append(ids)
+                result = {"input_ids": input_ids, "attention_mask": [[1]*len(ids) for ids in input_ids]}
+                if return_tensors == "pt":
+                    # Pad sequences
+                    max_len = max(len(ids) for ids in input_ids)
+                    for ids in input_ids:
+                        ids.extend([0] * (max_len - len(ids)))
+                    result = {k: torch.tensor(v) for k, v in result.items()}
+                return result
+
+            def get_vocab(self):
+                return {self.audio_token: 999}
+
+        audio_processor = GraniteSpeechFeatureExtractor()
+        tokenizer = TrackingTokenizer()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=tokenizer,
+        )
+
+        # Create audio input (same dims as HF test)
+        vec_dims = [1, 269920]
+        audio = torch.rand(*vec_dims) - 0.5
+
+        audio_tokens = processor.audio_token * vec_dims[0]
+        inputs = processor(
+            text=f"{audio_tokens} Can you compare this audio?",
+            audio=audio,
+        )
+
+        # Verify input_features shape
+        assert inputs.get("input_features") is not None
+        assert list(inputs["input_features"].shape) == [vec_dims[0], 844, 160]
+
+    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
+    def test_audio_token_filling_varying_len_feature_list(self, mock_tokenizer):
+        """Ensure audio token filling is handled correctly when we have
+        multiple varying len audio sequences passed as a list.
+
+        HF Source: test_processing_granite_speech.py L165-197
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        vec_dims = [[1, 142100], [1, 269920]]
+        num_expected_features = [90, 171]
+        audio = [torch.rand(dims) - 0.5 for dims in vec_dims]
+
+        inputs = processor(
+            text=[
+                f"{processor.audio_token} Can you describe this audio?",
+                f"{processor.audio_token} How does it compare with this audio?",
+            ],
+            audio=audio,
+        )
+
+        # Verify input_features is not None
+        assert inputs.get("input_features") is not None
+
+        # Verify audio_embed_sizes match expected
+        assert inputs.get("audio_embed_sizes") is not None
+        assert inputs["audio_embed_sizes"] == num_expected_features
+
+    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
+    def test_expand_audio_tokens_single(self, mock_tokenizer):
+        """Test _expand_audio_tokens expands single audio token correctly.
+
+        HF Source: test_processing_granite_speech.py (implicit in processor tests)
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        text = ["<|audio|> transcribe this"]
+        audio_embed_sizes = [5]  # 5 embeddings for this audio
+
+        result = processor._expand_audio_tokens(text, audio_embed_sizes)
+
+        # Should expand <|audio|> to 5 copies
+        assert result[0].count("<|audio|}") == 5 or result[0].count("<|audio|>") == 5
+
+    @pytest.mark.xfail(reason="Skeleton _expand_audio_tokens not implemented")
+    def test_expand_audio_tokens_multiple(self, mock_tokenizer):
+        """Test _expand_audio_tokens expands multiple texts with different sizes.
+
+        HF Source: test_processing_granite_speech.py (implicit in processor tests)
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        text = [
+            "<|audio|> first audio",
+            "<|audio|> second audio",
+        ]
+        audio_embed_sizes = [3, 7]
+
+        result = processor._expand_audio_tokens(text, audio_embed_sizes)
+
+        # First text should have 3 audio tokens
+        # Second text should have 7 audio tokens
+        assert result[0].count("<|audio|>") == 3
+        assert result[1].count("<|audio|>") == 7
+
+    @pytest.mark.xfail(reason="Skeleton __call__ doesn't handle device")
+    @pytest.mark.skipif(
+        torch_device == "cpu",
+        reason="Test requires GPU/accelerator"
+    )
+    def test_device_override(self, mock_tokenizer):
+        """Ensure that regardless of the processing device, the tensors
+        produced are on the CPU.
+
+        HF Source: test_processing_granite_speech.py L199-221
+        """
+        audio_processor = GraniteSpeechFeatureExtractor()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=mock_tokenizer,
+        )
+
+        vec_dims = [1, 269920]
+        wav = torch.rand(vec_dims) - 0.5
+
+        inputs = processor(
+            text=f"{processor.audio_token} Can you transcribe this audio?",
+            audio=wav,
+            device=torch_device,
+        )
+
+        # Output should always be on CPU regardless of processing device
+        assert inputs["input_features"].device.type == "cpu"
 
 
 # =============================================================================
