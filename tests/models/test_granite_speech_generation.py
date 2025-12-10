@@ -88,7 +88,8 @@ class TestPrepareInputsForGeneration:
 
         input_ids = torch.randint(0, 998, (batch_size, seq_len))
         # Place audio tokens at the beginning
-        num_audio_tokens = (audio_len // small_config.window_size) * small_config.num_queries
+        # num_queries is in projector_config, not directly in GraniteSpeechConfig
+        num_audio_tokens = (audio_len // small_config.window_size) * small_config.projector_config.num_queries
         input_ids[0, :num_audio_tokens] = small_config.audio_token_index
 
         input_features = torch.randn(batch_size, audio_len, 160)
@@ -116,8 +117,9 @@ class TestPrepareInputsForGeneration:
         assert returned_kwargs["inputs_embeds"].shape[1] == seq_len
 
         # Test that forward works with the hook output
+        # Note: forward() returns (logits, cache) when use_cache=True
         with torch.no_grad():
-            logits, loss, cache = model(
+            logits, cache = model(
                 input_ids=returned_input_ids,
                 use_cache=True,
                 **returned_kwargs
@@ -166,7 +168,8 @@ class TestPrepareInputsForGeneration:
 
         input_ids = torch.randint(0, 998, (batch_size, seq_len))
         # Place audio tokens
-        num_audio_tokens = (audio_len // small_config.window_size) * small_config.num_queries
+        # num_queries is in projector_config, not directly in GraniteSpeechConfig
+        num_audio_tokens = (audio_len // small_config.window_size) * small_config.projector_config.num_queries
         input_ids[0, :num_audio_tokens] = small_config.audio_token_index
 
         input_features = torch.randn(batch_size, audio_len, 160)
