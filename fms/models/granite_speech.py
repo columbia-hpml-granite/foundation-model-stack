@@ -314,11 +314,9 @@ class GraniteSpeech(nn.Module):
         # Align mask shape with projected audio features; fallback to full mask
         audio_mask = input_features_mask
         if audio_mask.shape != audio_features.shape[:2]:
-            logger.warning(
-                "input_features_mask shape %s does not match projected audio shape %s; using full mask",
-                audio_mask.shape,
-                audio_features.shape[:2],
-            )
+            # Note: Logging removed for torch.compile compatibility
+            # The mask shape mismatch is expected when input_features_mask is for
+            # raw features but audio_features is already projected
             audio_mask = torch.ones(
                 audio_features.shape[:2],
                 device=audio_features.device,
