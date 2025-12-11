@@ -128,10 +128,25 @@ class GraniteSpeechConfig(ModelConfig):
         projector_config: SpeechProjectorConfig for Q-Former projector
         decoder_config: GraniteConfig for the language decoder
         audio_token_index: Special token ID for audio placeholder (default: 49155)
+                          Note: HF uses `audio_token_id` as an alias for this parameter.
         has_lora_adapter: Whether LoRA adapters should be toggled on only for audio inputs (default: True)
         downsample_rate: Temporal downsampling rate in projector (default: 5)
         window_size: Window size for projector's windowed attention (default: 15)
         initializer_range: Std for weight initialization (default: 0.02)
+
+    Note on HF Compatibility:
+        This FMS implementation has some intentional differences from HF:
+
+        1. **Return Type**: FMS returns tuples `(logits, loss)` or `(logits, cache)`,
+           while HF returns `GraniteSpeechCausalLMOutputWithPast` dataclass.
+           This is standard FMS convention for compatibility with `fms.utils.generation`.
+
+        2. **Loss Computation**: FMS does not filter by attention_mask in loss.
+           For correct behavior, use `labels=-100` for positions to ignore
+           (standard practice, same as HF's ignore_index default).
+
+        3. **Config Naming**: FMS uses `audio_token_index`, HF uses `audio_token_id`.
+           Both refer to the same concept.
     """
     # Nested sub-configs (FMS pattern from llava_next.py)
     encoder_config: ConformerConfig = field(
@@ -145,8 +160,9 @@ class GraniteSpeechConfig(ModelConfig):
     )
 
     # Audio token settings (from HF GraniteSpeechConfig)
-    # Default matches granite-speech-3.3-2b; may differ for other variants
-    audio_token_index: int = 49159
+    # HF default: 49155 (configuration_granite_speech.py:164)
+    # HF uses `audio_token_id` as alias (attribute_map in config)
+    audio_token_index: int = 49155
     has_lora_adapter: bool = True
 
     # Projector window settings (from HF)
@@ -447,12 +463,22 @@ class GraniteSpeech(nn.Module):
             attention_mask: Attention mask for the decoder
             position_ids: Optional position IDs
             inputs_embeds: Pre-computed embeddings (mutually exclusive with input_ids)
-            labels: Labels for language modeling loss
+            labels: Labels for language modeling loss. Use -100 for positions to ignore
+                   (padding, prompt tokens, etc.) - this is standard CrossEntropyLoss behavior.
             use_cache: Whether to use KV cache
             past_key_values: Cached key/value states
 
         Returns:
-            Tuple of (logits, optional_loss, optional_past_key_values)
+            Tuple depending on use_cache:
+            - If use_cache=True: (logits, cache)
+            - If use_cache=False: (logits, loss) where loss is None if labels not provided
+
+        Note:
+            Unlike HF which returns a dataclass (GraniteSpeechCausalLMOutputWithPast),
+            FMS returns tuples for compatibility with fms.utils.generation.
+
+            Unlike HF which filters loss by attention_mask, FMS relies on labels=-100
+            to exclude positions from loss computation (standard CrossEntropyLoss behavior).
         """
         # Check if inputs_embeds is provided via kwargs (from prepare_inputs_for_generation hook)
         # This allows the generation hook to pass pre-computed embeddings
@@ -811,10 +837,11 @@ def _hf_to_fms_names(
         (r"\.crossattention\.attention\.value\.", ".cross_attention.value."),
         (r"\.crossattention\.output\.dense\.", ".cross_attention_output.dense."),
         (r"\.crossattention\.output\.LayerNorm\.", ".cross_attention_output.LayerNorm."),
-        # Feed-forward
-        (r"\.intermediate_query\.dense\.", ".feed_forward.dense_in."),
-        (r"\.output_query\.dense\.", ".feed_forward.dense_out."),
-        (r"\.output_query\.LayerNorm\.", ".feed_forward.LayerNorm."),
+        # Feed-forward (query-specific FFN: intermediate_query + output_query)
+        # HF names map directly to FMS names after adding separate query FFN modules
+        (r"\.intermediate_query\.dense\.", ".intermediate_query.dense."),
+        (r"\.output_query\.dense\.", ".output_query.dense."),
+        (r"\.output_query\.LayerNorm\.", ".output_query.LayerNorm."),
         # Output projection
         (r"^projector\.linear\.", "projector.output_proj."),
     ]

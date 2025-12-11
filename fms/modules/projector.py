@@ -43,6 +43,9 @@ class SpeechProjectorConfig(ModelConfig):
 
     Args:
         encoder_dim: Input dimension from Conformer encoder (default: 1024)
+        encoder_hidden_size: Input dimension for cross-attention K/V projections.
+                            In HF Blip2, cross-attention uses encoder_hidden_size for K/V.
+                            If None, defaults to encoder_dim.
         decoder_dim: Output dimension for language decoder (default: 2048)
         window_size: Window size for temporal downsampling (default: 15)
         downsample_rate: Downsampling rate (default: 5)
@@ -53,6 +56,9 @@ class SpeechProjectorConfig(ModelConfig):
         num_hidden_layers: Number of transformer layers in Q-Former (default: 2)
         num_attention_heads: Number of attention heads (default: 16)
         intermediate_size: Hidden size in feed-forward network (default: 4096)
+        cross_attention_frequency: Frequency of cross-attention layers.
+                                   Cross-attention is added when layer_idx % frequency == 0.
+                                   Default: 1 (every layer has cross-attention)
 
         # Regularization
         hidden_dropout_prob: Dropout probability for hidden layers (default: 0.1)
@@ -69,18 +75,20 @@ class SpeechProjectorConfig(ModelConfig):
     """
 
     # Input/Output dimensions
-    encoder_dim: int = 1024 # Conformer output dimension
-    decoder_dim: int = 2048 # Language decoder input dimension
+    encoder_dim: int = 1024  # Conformer output dimension (also Q-Former hidden_size)
+    encoder_hidden_size: Optional[int] = None  # For cross-attention K/V (defaults to encoder_dim)
+    decoder_dim: int = 2048  # Language decoder input dimension
 
     # Window/downsampling (HF Granite Speech)
     window_size: int = 15
     downsample_rate: int = 5
-    num_queries: int = 3 # Derived as window_size // downsample_rate in HF
+    num_queries: int = 3  # Derived as window_size // downsample_rate in HF
 
     # Q-Former architecture
-    num_hidden_layers: int = 2 # Number of transformer layers (HF default)
-    num_attention_heads: int = 16 # Number of attention heads (HF Blip2QFormer)
-    intermediate_size: int = 4096 # FFN hidden size
+    num_hidden_layers: int = 2  # Number of transformer layers (HF default)
+    num_attention_heads: int = 16  # Number of attention heads (HF Blip2QFormer)
+    intermediate_size: int = 4096  # FFN hidden size
+    cross_attention_frequency: int = 1  # Every Nth layer has cross-attention (HF Blip2 default: 2)
 
     # Regularization
     hidden_dropout_prob: float = 0.1
@@ -189,6 +197,9 @@ class QFormerCrossAttention(nn.Module):
 
     Queries attend to encoder outputs (keys/values from Conformer).
 
+    Note: HF Blip2 uses `encoder_hidden_size` for K/V projections in cross-attention,
+    which may differ from `hidden_size` (encoder_dim). This matches that behavior.
+
     Args:
         config: SpeechProjectorConfig with attention parameters
     """
@@ -205,10 +216,13 @@ class QFormerCrossAttention(nn.Module):
         self.attention_head_size = config.encoder_dim // config.num_attention_heads
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        # Note: queries from queries; keys/values from encoder
+        # encoder_hidden_size for K/V (matches HF Blip2 cross-attention)
+        encoder_hidden_size = config.encoder_hidden_size or config.encoder_dim
+
+        # Query from query states (encoder_dim), K/V from encoder outputs (encoder_hidden_size)
         self.query = nn.Linear(config.encoder_dim, self.all_head_size)
-        self.key = nn.Linear(config.encoder_dim, self.all_head_size)
-        self.value = nn.Linear(config.encoder_dim, self.all_head_size)
+        self.key = nn.Linear(encoder_hidden_size, self.all_head_size)
+        self.value = nn.Linear(encoder_hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_dropout_prob)
 
@@ -292,6 +306,53 @@ class QFormerAttentionOutput(nn.Module):
         return hidden_states
 
 
+class QFormerIntermediate(nn.Module):
+    """
+    Intermediate layer for Q-Former FFN (matches HF Blip2QFormerIntermediate).
+
+    Architecture:
+        hidden_states -> Linear (encoder_dim -> intermediate_size) -> Activation
+
+    Args:
+        config: SpeechProjectorConfig with FFN parameters
+    """
+
+    def __init__(self, config: SpeechProjectorConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.encoder_dim, config.intermediate_size)
+        self.intermediate_act_fn = str_to_activation(config.hidden_act)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        return hidden_states
+
+
+class QFormerOutput(nn.Module):
+    """
+    Output layer for Q-Former FFN (matches HF Blip2QFormerOutput).
+
+    Architecture:
+        hidden_states -> Linear (intermediate_size -> encoder_dim) ->
+        Dropout -> LayerNorm (with residual)
+
+    Args:
+        config: SpeechProjectorConfig with FFN parameters
+    """
+
+    def __init__(self, config: SpeechProjectorConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.intermediate_size, config.encoder_dim)
+        self.LayerNorm = nn.LayerNorm(config.encoder_dim, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        return hidden_states
+
+
 class QFormerFeedForward(nn.Module):
     """
     Feed-forward network for Q-Former transformer block.
@@ -338,22 +399,46 @@ class QFormerLayer(nn.Module):
 
     Architecture:
         1. Self-Attention (queries attend to themselves)
-        2. Cross-Attention (queries attend to encoder outputs)
-        3. Feed-Forward Network
+        2. Cross-Attention (queries attend to encoder outputs) - conditional based on layer_idx
+        3. Feed-Forward Network (separate intermediate_query/output_query for query tokens)
 
     Each sublayer has residual connections and layer normalization.
 
+    Note: HF Blip2 has:
+        - Conditional cross-attention based on `cross_attention_frequency`
+        - Separate `intermediate_query` and `output_query` FFN for query tokens
+
     Args:
         config: SpeechProjectorConfig with layer parameters
+        layer_idx: Index of this layer (for cross_attention_frequency check)
     """
 
-    def __init__(self, config: SpeechProjectorConfig):
+    def __init__(self, config: SpeechProjectorConfig, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
+
+        # Self-attention (always present)
         self.self_attention = QFormerSelfAttention(config)
         self.self_attention_output = QFormerAttentionOutput(config)
-        self.cross_attention = QFormerCrossAttention(config)
-        self.cross_attention_output = QFormerAttentionOutput(config)
-        self.feed_forward = QFormerFeedForward(config)
+
+        # Cross-attention (conditional based on cross_attention_frequency)
+        # HF: layer_idx % cross_attention_frequency == 0
+        if layer_idx % config.cross_attention_frequency == 0:
+            self.cross_attention = QFormerCrossAttention(config)
+            self.cross_attention_output = QFormerAttentionOutput(config)
+            self.has_cross_attention = True
+        else:
+            self.has_cross_attention = False
+
+        # Query-specific FFN (matches HF Blip2's intermediate_query + output_query)
+        self.intermediate_query = QFormerIntermediate(config)
+        self.output_query = QFormerOutput(config)
+
+    def _feed_forward_chunk_query(self, attention_output: torch.Tensor) -> torch.Tensor:
+        """Query-specific feed-forward (matches HF Blip2QFormerLayer.feed_forward_chunk_query)."""
+        intermediate_output = self.intermediate_query(attention_output)
+        layer_output = self.output_query(intermediate_output, attention_output)
+        return layer_output
 
     def forward(
         self,
@@ -380,16 +465,17 @@ class QFormerLayer(nn.Module):
         sa_output = self.self_attention(query_states, attention_mask=query_attention_mask)
         query_states = self.self_attention_output(sa_output, query_states)
 
-        # 2. Cross-attention: queries attend over encoder outputs
-        ca_output = self.cross_attention(
-            query_states=query_states,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-        )
-        query_states = self.cross_attention_output(ca_output, query_states)
+        # 2. Cross-attention: queries attend over encoder outputs (if this layer has cross-attention)
+        if self.has_cross_attention:
+            ca_output = self.cross_attention(
+                query_states=query_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+            query_states = self.cross_attention_output(ca_output, query_states)
 
-        # 3. Feed-forward network
-        query_states = self.feed_forward(query_states)
+        # 3. Query-specific feed-forward network
+        query_states = self._feed_forward_chunk_query(query_states)
         return query_states
 
 
@@ -481,9 +567,9 @@ class SpeechProjector(nn.Module):
         self.input_layernorm = nn.LayerNorm(config.encoder_dim, eps=config.layer_norm_eps)
         self.input_dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # Stack of Q-Former layers
+        # Stack of Q-Former layers (pass layer_idx for cross_attention_frequency check)
         self.layers = nn.ModuleList(
-            [QFormerLayer(config) for _ in range(config.num_hidden_layers)]
+            [QFormerLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
 
         # Output projection to decoder dimension
