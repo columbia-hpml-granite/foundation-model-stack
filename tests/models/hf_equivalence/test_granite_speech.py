@@ -75,9 +75,9 @@ def _load_fms_granite_speech(model_id: str, device: str = "cuda"):
     This relies on the adapter we registered at the bottom of
     fms/models/granite_speech.py via serialization.register_adapter(...).
     """
-    # NOTE: The variant name ("3.2-8b") should match how we registered
+    # NOTE: The variant name ("3.3-2b") should match how we registered
     # the model in granite_speech.py. Adjust if the variant name differs.
-    fms_model = get_model("granite_speech", "3.2-8b")
+    fms_model = get_model("granite_speech", "3.3-2b")
     fms_model.to(device)
     fms_model.eval()
 
@@ -152,7 +152,7 @@ def _run_fms(model_id: str, device: str = "cuda"):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Granite Speech HF equivalence test requires CUDA"
 )
-def test_granite_speech_3_2_8b_equivalence():
+def test_granite_speech_3_3_2b_equivalence():
     """
     Main equivalence test:
 
@@ -163,8 +163,8 @@ def test_granite_speech_3_2_8b_equivalence():
     device = "cuda"
     torch.set_default_dtype(torch.float32)
 
-    # We can change this to the 2B variant alternatively
-    model_id = "ibm-granite/granite-speech-3.2-8b"
+    # Using 3.3-2b as 3.2-8b uses granite_speech_qformer which is not registered in transformers yet
+    model_id = "ibm-granite/granite-speech-3.3-2b"
 
     hf_logits, _, _ = _run_hf(model_id, device=device)
     fms_logits, _, _ = _run_fms(model_id, device=device)
@@ -180,4 +180,4 @@ def test_granite_speech_3_2_8b_equivalence():
 
 if __name__ == "__main__":
     # Allow running as a standalone script for quick debugging.
-    test_granite_speech_3_2_8b_equivalence()
+    test_granite_speech_3_3_2b_equivalence()
