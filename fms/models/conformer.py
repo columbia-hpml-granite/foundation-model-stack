@@ -563,8 +563,9 @@ class ConformerEncoder(nn.Module):
 
         # Precompute relative position distances for attention
         # Use context_size x context_size buffer to match HF's implementation
+        # persistent=False matches HF behavior - buffer not saved in state_dict
         attention_dists = self._precompute_attention_dists()
-        self.register_buffer("attention_dists", attention_dists)
+        self.register_buffer("attention_dists", attention_dists, persistent=False)
 
     @classmethod
     def from_config(cls, config: ConformerConfig) -> "ConformerEncoder":
@@ -638,8 +639,10 @@ class ConformerEncoder(nn.Module):
 
             # Mid-layer CTC feedback (HF-aligned)
             # At the middle layer, compute CTC output and feed back into encoder
+            # Clone before CTC to match HF gradient flow behavior
             if self.config.use_ctc and self.out is not None and idx == mid_layer:
-                x_mid = self.out(x)  # (batch, seq_len, output_dim)
+                x_mid = x.clone()  # Clone to match HF gradient computation
+                x_mid = self.out(x_mid)  # (batch, seq_len, output_dim)
                 x = x + self.out_mid(F.softmax(x_mid, dim=-1))  # Feedback to encoder
 
         # 5. Return final hidden states
