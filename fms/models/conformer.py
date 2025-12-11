@@ -318,6 +318,7 @@ class ConformerConvModule(nn.Module):
 
         # Depthwise convolution with padding
         # Padding = (kernel_size - 1) // 2 for 'same' padding
+        # Note: bias=False to match HF granite_speech encoder
         self.depthwise_conv = nn.Conv1d(
             dim * expansion_factor,
             dim * expansion_factor,
@@ -325,6 +326,7 @@ class ConformerConvModule(nn.Module):
             stride=1,
             padding=(kernel_size - 1) // 2,
             groups=dim * expansion_factor,  # Depthwise: each input channel convolved separately
+            bias=False,
         )
 
         # Batch normalization

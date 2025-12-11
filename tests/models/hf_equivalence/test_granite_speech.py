@@ -96,7 +96,7 @@ def _load_fms_granite_speech(model_id: str, device: str = "cuda"):
     #   - rename keys
     #   - split KV weights if needed
     #   - fuse/unfuse any special parameters
-    fms_state = serialization.apply_adapter("granite_speech", "hf", hf_state)
+    fms_state = serialization.get_adapted("granite_speech", "hf", hf_state, {})
 
     missing, unexpected = fms_model.load_state_dict(fms_state, strict=False)
     if missing:
