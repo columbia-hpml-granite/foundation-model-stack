@@ -568,6 +568,24 @@ class ConformerEncoder(nn.Module):
         attention_dists = self._precompute_attention_dists()
         self.register_buffer("attention_dists", attention_dists, persistent=False)
 
+    def _recompute_buffers(self):
+        """
+        Recompute non-persistent buffers after device transfer from meta.
+
+        FMS uses meta device for lazy model instantiation: get_model() creates
+        the model on torch.device("meta"), then to_empty() allocates real memory,
+        and load_state_dict() loads weights. However, non-persistent buffers
+        (persistent=False) are not saved in state_dict, so they retain garbage
+        values from meta device computation.
+
+        This method should be called from post_init() after the model has been
+        transferred to a real device to ensure buffers contain valid values.
+        """
+        if self.attention_dists.device.type != "meta":
+            # Only recompute if we're on a real device now
+            attention_dists = self._precompute_attention_dists()
+            self.register_buffer("attention_dists", attention_dists, persistent=False)
+
     @classmethod
     def from_config(cls, config: ConformerConfig) -> "ConformerEncoder":
         return cls(config)
