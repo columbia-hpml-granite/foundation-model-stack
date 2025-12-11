@@ -39,8 +39,8 @@ def _build_inputs(processor, device: str):
     prompt = "Transcribe the following audio: <|audio|>"
 
     inputs = processor(
-        audios=[audio],
-        text=[prompt],
+        audio=audio,
+        text=prompt,
         return_tensors="pt",
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}

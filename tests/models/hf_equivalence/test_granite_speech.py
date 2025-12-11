@@ -57,9 +57,8 @@ def _get_sample_inputs(processor, device: str = "cuda"):
 
     inputs = processor(
         text=text,
-        audios=[audio],
+        audio=audio,
         return_tensors="pt",
-        device=device,
     )
 
     # Move tensors to the right device
