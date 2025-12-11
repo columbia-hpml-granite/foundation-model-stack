@@ -487,6 +487,132 @@ class TestGraniteSpeechModel:
         assert logits is not None
         assert not torch.isnan(logits).any().item()
 
+    @pytest.mark.skipif(
+        torch_device == "cpu",
+        reason="FP16 test requires GPU"
+    )
+    def test_granite_speech_model_fp16_forward(self, model_tester):
+        """Test FP16 forward pass for GraniteSpeech model.
+
+        Verifies that the model produces valid (non-NaN) logits when
+        running in FP16 precision on GPU.
+
+        HF Source: test_modeling_granite_speech.py L180-191
+        (create_and_check_granite_speech_model_fp16_forward)
+        """
+        import math
+
+        config, inputs_dict = model_tester.prepare_config_and_inputs_for_common()
+
+        model = GraniteSpeech(config)
+        model.to(torch_device)
+        model.half()
+        model.eval()
+
+        # Initialize weights with small values for FP16 stability
+        torch.manual_seed(42)
+        sd = model.state_dict()
+        for key in sd.keys():
+            param = sd[key]
+            if param.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                continue
+            if "running_mean" in key or "running_var" in key:
+                continue
+            # Use smaller values for FP16 stability
+            values = torch.randn_like(param) * 0.01
+            param.copy_(values)
+
+        # Calculate correct number of audio tokens
+        window_size = model_tester.window_size
+        num_queries = model_tester.projector_config.num_queries
+        num_windows = math.ceil(model_tester.sequence_dim / window_size)
+        actual_num_audio_tokens = num_windows * num_queries
+
+        # Create input_ids with correct number of audio tokens
+        batch_size = model_tester.batch_size
+        seq_length = model_tester.seq_len + actual_num_audio_tokens
+        input_ids = torch.randint(
+            2, config.decoder_config.src_vocab_size,
+            (batch_size, seq_length), device=torch_device
+        )
+        input_ids[:, :actual_num_audio_tokens] = config.audio_token_index
+
+        input_features = inputs_dict["input_features"].to(torch_device).half()
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=torch_device)
+
+        with torch.no_grad():
+            logits, _ = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                input_features=input_features,
+            )
+
+        assert logits is not None
+        assert not torch.isnan(logits).any().item(), "FP16 forward produced NaN values"
+
+    @pytest.mark.skipif(
+        torch_device == "cpu",
+        reason="FP16 autocast test requires GPU"
+    )
+    def test_granite_speech_model_fp16_autocast_forward(self, model_tester):
+        """Test FP16 autocast forward pass for GraniteSpeech model.
+
+        Verifies that the model produces valid (non-NaN) logits when
+        running with torch.autocast in FP16 precision.
+
+        HF Source: test_modeling_granite_speech.py L193-211
+        (create_and_check_granite_speech_model_fp16_autocast_forward)
+        """
+        import math
+
+        config, inputs_dict = model_tester.prepare_config_and_inputs_for_common()
+
+        model = GraniteSpeech(config)
+        model.to(torch_device)
+        model.eval()
+
+        # Initialize weights with small values for FP16 stability
+        torch.manual_seed(42)
+        sd = model.state_dict()
+        for key in sd.keys():
+            param = sd[key]
+            if param.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                continue
+            if "running_mean" in key or "running_var" in key:
+                continue
+            # Use smaller values for FP16 stability
+            values = torch.randn_like(param) * 0.01
+            param.copy_(values)
+
+        # Calculate correct number of audio tokens
+        window_size = model_tester.window_size
+        num_queries = model_tester.projector_config.num_queries
+        num_windows = math.ceil(model_tester.sequence_dim / window_size)
+        actual_num_audio_tokens = num_windows * num_queries
+
+        # Create input_ids with correct number of audio tokens
+        batch_size = model_tester.batch_size
+        seq_length = model_tester.seq_len + actual_num_audio_tokens
+        input_ids = torch.randint(
+            2, config.decoder_config.src_vocab_size,
+            (batch_size, seq_length), device=torch_device
+        )
+        input_ids[:, :actual_num_audio_tokens] = config.audio_token_index
+
+        input_features = inputs_dict["input_features"].to(torch_device).to(torch.bfloat16)
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=torch_device)
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.no_grad():
+                logits, _ = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    input_features=input_features,
+                )
+
+        assert logits is not None
+        assert not torch.isnan(logits).any().item(), "FP16 autocast forward produced NaN values"
+
 
 # =============================================================================
 # FMS Native Feature Extractor and Processor Tests
@@ -990,6 +1116,63 @@ class TestFMSGraniteSpeechProcessor:
         )
 
         # Verify input_features shape
+        assert inputs.get("input_features") is not None
+        assert list(inputs["input_features"].shape) == [vec_dims[0], 844, 160]
+
+    def test_audio_token_filling_same_len_feature_numpy(self, mock_tokenizer):
+        """Ensure audio token filling is handled correctly with numpy array input.
+
+        This test validates that the processor can handle numpy arrays in addition
+        to torch tensors, matching the HF parameterized test.
+
+        HF Source: test_processing_granite_speech.py L130-163 (np.random.rand variant)
+        """
+        # Create a mock tokenizer that tracks audio tokens
+        class TrackingTokenizer:
+            def __init__(self):
+                self.audio_token = "<|audio|>"
+
+            def __call__(self, text, return_tensors=None, **kwargs):
+                if isinstance(text, str):
+                    text = [text]
+                input_ids = []
+                for t in text:
+                    ids = []
+                    for char in t.split():
+                        if char == self.audio_token:
+                            ids.append(999)
+                        else:
+                            ids.append(1)
+                    input_ids.append(ids)
+                result = {"input_ids": input_ids, "attention_mask": [[1]*len(ids) for ids in input_ids]}
+                if return_tensors == "pt":
+                    max_len = max(len(ids) for ids in input_ids)
+                    for ids in input_ids:
+                        ids.extend([0] * (max_len - len(ids)))
+                    result = {k: torch.tensor(v) for k, v in result.items()}
+                return result
+
+            def get_vocab(self):
+                return {self.audio_token: 999}
+
+        audio_processor = GraniteSpeechFeatureExtractor()
+        tokenizer = TrackingTokenizer()
+        processor = GraniteSpeechProcessor(
+            audio_processor=audio_processor,
+            tokenizer=tokenizer,
+        )
+
+        # Create audio input as numpy array (HF test uses np.random.rand)
+        vec_dims = [1, 269920]
+        audio = np.random.rand(*vec_dims) - 0.5
+
+        audio_tokens = processor.audio_token * vec_dims[0]
+        inputs = processor(
+            text=f"{audio_tokens} Can you compare this audio?",
+            audio=audio,
+        )
+
+        # Verify input_features shape (same as torch.rand variant)
         assert inputs.get("input_features") is not None
         assert list(inputs["input_features"].shape) == [vec_dims[0], 844, 160]
 
