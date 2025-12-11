@@ -14,6 +14,9 @@ This directory contains comparison documents for validating the migration of `gr
 | `conformer_encoder_comparison.md` | ConformerEncoder vs GraniteSpeechCTCEncoder | DISCREPANCIES FOUND |
 | `projector_comparison.md` | SpeechProjector vs GraniteSpeechEncoderProjector (Blip2QFormer) | **CRITICAL DISCREPANCIES** |
 | `granite_speech_model_comparison.md` | GraniteSpeech vs GraniteSpeechForConditionalGeneration | DISCREPANCIES FOUND |
+| `processor_comparison.md` | GraniteSpeechProcessor vs GraniteSpeechProcessor | MINOR DISCREPANCIES |
+| `feature_extractor_comparison.md` | GraniteSpeechFeatureExtractor vs GraniteSpeechFeatureExtractor | MINOR DISCREPANCIES |
+| `configuration_comparison.md` | All Config classes (Encoder, Projector, Main) | **CRITICAL DISCREPANCIES** |
 
 ## Reference Paths
 
@@ -44,6 +47,11 @@ This directory contains comparison documents for validating the migration of `gr
 | ConformerEncoder | `conformer.py:514-646` | `modeling_granite_speech.py:253-279` | DISCREPANCIES |
 | SpeechProjector | `projector.py:396-587` | `modeling_granite_speech.py:64-95` + `blip_2/` | **CRITICAL** |
 | GraniteSpeech | `granite_speech.py:173-623` | `modeling_granite_speech.py:303-544` | DISCREPANCIES |
+| GraniteSpeechProcessor | `granite_speech.py:1165-1314` | `processing_granite_speech.py:32-96` | MINOR |
+| GraniteSpeechFeatureExtractor | `granite_speech.py:935-1163` | `feature_extraction_granite_speech.py:38-186` | MINOR |
+| ConformerConfig | `conformer.py:22-79` | `configuration_granite_speech.py:21-105` | **CRITICAL** |
+| SpeechProjectorConfig | `projector.py:31-96` | `Blip2QFormerConfig` (blip_2) | **CRITICAL** |
+| GraniteSpeechConfig | `granite_speech.py:115-166` | `configuration_granite_speech.py:107-196` | **CRITICAL** |
 
 ---
 
@@ -74,6 +82,32 @@ This directory contains comparison documents for validating the migration of `gr
 | Loss computation | MEDIUM | HF handles attention mask in loss, FMS doesn't |
 | Forward return type | MEDIUM | HF returns dataclass, FMS returns tuple |
 
+### GraniteSpeechProcessor (MINOR)
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| No ProcessorMixin | MEDIUM | FMS doesn't inherit from ProcessorMixin (missing save/load methods) |
+| Return type | LOW | HF returns `BatchFeature`, FMS returns plain `dict` |
+| Missing chat_template | LOW | FMS doesn't support chat_template parameter |
+
+### GraniteSpeechFeatureExtractor (MINOR)
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| No FeatureExtractionMixin | MEDIUM | FMS missing save/load/serialization methods |
+| Return type | LOW | HF returns `BatchFeature`, FMS returns plain `dict` |
+| Core algorithms | NONE | Mel extraction, length calc, mask creation are **IDENTICAL** |
+
+### Configuration Classes (CRITICAL)
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| `num_layers` default | **CRITICAL** | HF=10, FMS=16 - model architecture mismatch |
+| `audio_token_index` default | **CRITICAL** | HF=49155, FMS=49159 - will break inference |
+| `input_dim` vs `num_features` | MEDIUM | Different parameter naming |
+| `text_config` vs `decoder_config` | MEDIUM | Different parameter naming |
+| Missing projector params | **CRITICAL** | `cross_attention_frequency`, `encoder_hidden_size` not in FMS |
+
 ---
 
 ## Priority Actions
@@ -84,6 +118,13 @@ This directory contains comparison documents for validating the migration of `gr
 2. **Add `cross_attention_frequency` config** and conditional cross-attention creation
 3. **Add separate `intermediate_query` and `output_query`** FFN modules for query tokens
 4. **Update weight name mapping** in `_hf_to_fms_names`
+
+### HIGH PRIORITY - Configuration Fixes Required
+
+1. **Fix `num_layers` default** in ConformerConfig (16 -> 10 to match HF default, or make model-specific)
+2. **Fix `audio_token_index` default** in GraniteSpeechConfig (49159 -> 49155 to match HF)
+3. **Rename `num_features` to `input_dim`** in ConformerConfig for consistency
+4. **Rename `decoder_config` to `text_config`** in GraniteSpeechConfig for consistency
 
 ### MEDIUM PRIORITY - Encoder Fixes
 
@@ -113,6 +154,8 @@ When continuing this migration validation:
 - ConformerFeedForward
 - ConformerConvModule
 - ConformerBlock
+- GraniteSpeechProcessor (core logic identical, minor API differences)
+- GraniteSpeechFeatureExtractor (mel extraction/length calc identical, minor API differences)
 
 **NEEDS FIXES:**
 - ConformerEncoder (minor fixes)
