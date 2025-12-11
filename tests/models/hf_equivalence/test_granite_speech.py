@@ -74,13 +74,7 @@ def _load_fms_granite_speech(model_id: str, device: str = "cuda"):
     This relies on the adapter we registered at the bottom of
     fms/models/granite_speech.py via serialization.register_adapter(...).
     """
-    # NOTE: The variant name ("3.3-2b") should match how we registered
-    # the model in granite_speech.py. Adjust if the variant name differs.
-    fms_model = get_model("granite_speech", "3.3-2b")
-    fms_model.to(device)
-    fms_model.eval()
-
-    # Grab HF state dict via transformers
+    # Grab HF model to extract config and state dict
     from transformers import GraniteSpeechForConditionalGeneration
 
     hf_model = GraniteSpeechForConditionalGeneration.from_pretrained(
@@ -88,6 +82,24 @@ def _load_fms_granite_speech(model_id: str, device: str = "cuda"):
         torch_dtype=torch.float32,
         device_map=device,
     ).eval()
+
+    # Extract audio_token_index from HF config
+    # Different model versions use different values:
+    # - granite-speech-3.2-8b: 49155
+    # - granite-speech-3.3-2b: 49159
+    # - granite-speech-3.3-8b: 49159
+    audio_token_index = getattr(hf_model.config, "audio_token_index", 49155)
+
+    # NOTE: The variant name ("3.3-2b") should match how we registered
+    # the model in granite_speech.py. Adjust if the variant name differs.
+    # Pass audio_token_index to ensure FMS uses the same value as HF model
+    fms_model = get_model(
+        "granite_speech",
+        "3.3-2b",
+        audio_token_index=audio_token_index,
+    )
+    fms_model.to(device)
+    fms_model.eval()
 
     hf_state = hf_model.state_dict()
 
