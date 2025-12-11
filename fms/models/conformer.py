@@ -23,12 +23,13 @@ class ConformerConfig(ModelConfig):
     """
     Configuration class for Conformer encoder.
 
-    Default values are set to match Granite-Speech-3.3-8b specifications.
+    Default values match HF GraniteSpeechEncoderConfig (configuration_granite_speech.py:76-90).
 
     Args:
         num_features: Number of input audio features (default: 160 = 80 log-mel * 2 channels)
+                     Note: HF uses `input_dim` for this parameter.
         hidden_dim: Hidden dimension for encoder layers
-        num_layers: Number of Conformer blocks (default: 16)
+        num_layers: Number of Conformer blocks (default: 10, matching HF)
         num_heads: Number of attention heads in multi-head attention
         dim_head: Dimension per attention head
         conv_kernel_size: Kernel size for depthwise convolution
@@ -38,14 +39,14 @@ class ConformerConfig(ModelConfig):
         max_pos_emb: Maximum positional embedding distance for relative attention
         context_size: Local attention window size (sequence positions are clamped to +/- context_size)
         output_dim: CTC output dimension for mid-layer supervision
-        use_ctc: Enable/disable mid-layer CTC output
+        use_ctc: Enable/disable mid-layer CTC output (FMS-only parameter)
         activation: Activation function name (default: "silu" for SiLU/Swish)
         linear_config: Configuration for linear module selection
     """
 
-    num_features: int = 160  # Input: 80 log-mel * 2 channels
-    hidden_dim: int = 1024  # Encoder hidden dimension
-    num_layers: int = 16  # Number of Conformer blocks
+    num_features: int = 160  # HF: input_dim
+    hidden_dim: int = 1024
+    num_layers: int = 10  # HF default: 10 (granite-speech-3.3-2b uses 16)
 
     # Multi-head attention parameters
     num_heads: int = 8
