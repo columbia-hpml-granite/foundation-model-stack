@@ -145,7 +145,8 @@ class GraniteSpeechConfig(ModelConfig):
     )
 
     # Audio token settings (from HF GraniteSpeechConfig)
-    audio_token_index: int = 49155
+    # Default matches granite-speech-3.3-2b; may differ for other variants
+    audio_token_index: int = 49159
     has_lora_adapter: bool = True
 
     # Projector window settings (from HF)
@@ -481,20 +482,20 @@ class GraniteSpeech(nn.Module):
             if input_features is not None:
                 if input_ids is None:
                     raise ValueError("input_ids are required when using input_features.")
+                # Extracting audio features through encoder + projector
+                audio_embeds = self.get_audio_features(input_features)
+
+                # Build mask for projected audio embeddings if not provided
+                # Note: input_features_mask from HF processor is for projected embeddings,
+                # not raw input features. If None, create a full mask.
                 if input_features_mask is None:
-                    input_features_mask = input_features.new_ones(
-                        input_features.shape[:2], dtype=torch.bool
+                    input_features_mask = audio_embeds.new_ones(
+                        audio_embeds.shape[:2], dtype=torch.bool
                     )
                 input_features_mask = input_features_mask.to(
-                    device=input_features.device, dtype=torch.bool
+                    device=audio_embeds.device, dtype=torch.bool
                 )
-                if input_features_mask.shape != input_features.shape[:2]:
-                    raise ValueError(
-                        "input_features_mask must match input_features shape "
-                        f"{input_features.shape[:2]}, got {input_features_mask.shape}"
-                    )
-                # Extracting audio features
-                audio_embeds = self.get_audio_features(input_features)
+
                 # Injecting audio into token stream
                 inputs_embeds = self.get_merged_audio_embeddings(
                     input_ids=input_ids,
@@ -640,18 +641,22 @@ _architecture_name = "granite_speech"
 # Register model variants so get_model() can instantiate Granite Speech
 _granite_speech_default = GraniteSpeechConfig()
 
+# Config matching HF granite-speech-3.3-2b:
+# - Language model: hidden_size=2048, num_layers=40, heads=32, kv_heads=8, intermediate=8192
+# - Encoder: output_dim=256
+# - Projector: output to decoder hidden_size=2048
 _granite_speech_2b = GraniteSpeechConfig(
-    encoder_config=_default_encoder_config,
-    projector_config=_default_projector_config.updated(decoder_dim=3072),
+    encoder_config=_default_encoder_config.updated(output_dim=256),
+    projector_config=_default_projector_config.updated(decoder_dim=2048),
     decoder_config=GraniteConfig(
         src_vocab_size=49160,
-        emb_dim=3072,
+        emb_dim=2048,
         norm_eps=1e-5,
-        nheads=24,
-        head_dim=128,
+        nheads=32,
+        head_dim=64,  # 2048 / 32 heads
         kvheads=8,
-        nlayers=32,
-        hidden_grow_factor=11008 / 3072,
+        nlayers=40,
+        hidden_grow_factor=8192 / 2048,  # intermediate_size / hidden_size = 4.0
         max_expected_seq_len=8192,
         rope_theta=10000.0,
         pad_id=0,
@@ -742,6 +747,8 @@ def _hf_to_fms_names(
     projector_replacements = [
         # Query embeddings
         (r"^projector\.query$", "projector.query_embeds"),
+        # Input layernorm
+        (r"^projector\.qformer\.layernorm\.", "projector.input_layernorm."),
         # QFormer encoder layers
         (r"^projector\.qformer\.encoder\.layer\.(\d+)", r"projector.layers.\1"),
         # Self-attention
@@ -777,8 +784,10 @@ def _hf_to_fms_names(
         (r"mlp\.gate_proj", "ff_sub_layer.wg"),
         (r"mlp\.up_proj", "ff_sub_layer.w1"),
         (r"mlp\.down_proj", "ff_sub_layer.w2"),
-        (r"input_layernorm", "ln"),
-        (r"post_attention_layernorm", "ff_ln"),
+        # Note: Patterns below must be specific to decoder layers to avoid
+        # matching projector.input_layernorm which was renamed from qformer.layernorm
+        (r"(decoder\.layers\.\d+\.)input_layernorm", r"\1ln"),
+        (r"(decoder\.layers\.\d+\.)post_attention_layernorm", r"\1ff_ln"),
     ]
 
     # Combine all replacements
@@ -789,9 +798,18 @@ def _hf_to_fms_names(
         new_name = name
         for pattern, repl in all_replacements:
             new_name = re.sub(pattern, repl, new_name)
+        # Strip .base_layer from PEFT-wrapped base weights (but keep lora_ keys as-is)
+        if ".base_layer." in new_name and ".lora_" not in new_name:
+            new_name = new_name.replace(".base_layer", "")
         new_sd[new_name] = param
 
     return new_sd
+
+
+def _is_peft_key(key: str) -> bool:
+    """Check if a key is from PEFT/LoRA weights."""
+    # Note: .base_layer is stripped in _hf_to_fms_names, so only check for lora_ keys
+    return ".lora_" in key
 
 
 def _granite_speech_weight_fusion(
@@ -803,12 +821,17 @@ def _granite_speech_weight_fusion(
     Apply weight fusion for the decoder (same as Granite).
 
     Note: Encoder and projector don't use fused weights.
+    Note: PEFT/LoRA weights (containing .lora_ or .base_layer.) are excluded
+          from fusion and kept separate.
     """
     from fms.utils import serialization
 
-    # Only apply fusion to decoder weights
-    decoder_sd = {k: v for k, v in input_sd.items() if k.startswith("decoder.")}
-    other_sd = {k: v for k, v in input_sd.items() if not k.startswith("decoder.")}
+    # Only apply fusion to decoder weights (excluding PEFT/LoRA weights)
+    decoder_sd = {k: v for k, v in input_sd.items()
+                  if k.startswith("decoder.") and not _is_peft_key(k)}
+    peft_sd = {k: v for k, v in input_sd.items() if _is_peft_key(k)}
+    other_sd = {k: v for k, v in input_sd.items()
+                if not k.startswith("decoder.") and not _is_peft_key(k)}
 
     has_fused_weights = True
     if model_config and model_config.decoder_config:
@@ -820,8 +843,8 @@ def _granite_speech_weight_fusion(
             serialization._attn_unfused_to_fused_step(decoder_sd)
         )
 
-    # Merge back
-    new_sd = {**other_sd, **decoder_sd}
+    # Merge back (including PEFT/LoRA weights unchanged)
+    new_sd = {**other_sd, **decoder_sd, **peft_sd}
     return new_sd
 
 
