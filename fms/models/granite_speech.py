@@ -658,7 +658,7 @@ _granite_speech_2b = GraniteSpeechConfig(
         nlayers=40,
         hidden_grow_factor=8192 / 2048,  # intermediate_size / hidden_size = 4.0
         max_expected_seq_len=8192,
-        rope_theta=10000.0,
+        rope_theta=10000000.0,  # 10M, not 10K - critical for correct attention
         pad_id=0,
         p_dropout=0.0,
         tie_heads=False,
@@ -683,29 +683,77 @@ models.register_model(
 # ============================================================================
 
 
-def _split_kv_weights(
+def _merge_lora_weights(
     input_sd: Mapping[str, Any], **kwargs
 ) -> Mapping[str, Any]:
     """
-    Split HF's combined key-value weights into separate FMS key and value weights.
+    Merge LoRA adapter weights into base weights.
 
-    HF uses: encoder.layers.{i}.attn.to_kv (combined K and V)
-    FMS uses: encoder.blocks.{i}.attn.to_k and encoder.blocks.{i}.attn.to_v (separate)
+    HuggingFace granite-speech models use LoRA adapters on q_proj and v_proj
+    in all decoder layers. This function merges the LoRA weights into the
+    base weights so FMS can use a standard decoder.
+
+    LoRA formula: output = (base_weight + lora_B @ lora_A * scaling) @ input
+    Merged weight: merged_weight = base_weight + lora_B @ lora_A * scaling
+
+    Granite-speech uses lora_alpha=32 and rank=64, so scaling = 32/64 = 0.5
     """
     new_sd = {}
+    lora_keys_processed = set()
 
-    kv_pattern = re.compile(r"^encoder\.blocks\.(\d+)\.attn\.to_kv\.weight$")
+    # LoRA scaling factor = lora_alpha / rank
+    # Granite-speech: alpha=32, rank=64, so scaling = 0.5
+    lora_scaling = 0.5
 
+    # Pattern to match LoRA weights
+    # Example: decoder.layers.0.attn.in_proj.query.lora_A.default.weight
+    lora_a_pattern = re.compile(
+        r"^(decoder\.layers\.\d+\.attn\.in_proj\.(query|value))\.lora_A\.default\.weight$"
+    )
+
+    # First pass: identify all LoRA pairs and merge them
     for name, param in input_sd.items():
-        match = kv_pattern.match(name)
+        match = lora_a_pattern.match(name)
         if match:
-            layer_idx = match.group(1)
-            # Split along the first dimension (output features)
-            k, v = param.chunk(2, dim=0)
-            new_sd[f"encoder.blocks.{layer_idx}.attn.to_k.weight"] = k
-            new_sd[f"encoder.blocks.{layer_idx}.attn.to_v.weight"] = v
-        else:
+            base_key = match.group(1)  # e.g., decoder.layers.0.attn.in_proj.query
+            proj_type = match.group(2)  # query or value
+
+            lora_a_key = name
+            lora_b_key = name.replace("lora_A", "lora_B")
+            base_weight_key = f"{base_key}.weight"
+
+            # Check all required keys exist
+            if lora_b_key in input_sd and base_weight_key in input_sd:
+                lora_a = input_sd[lora_a_key]  # (rank, in_features)
+                lora_b = input_sd[lora_b_key]  # (out_features, rank)
+                base_weight = input_sd[base_weight_key]  # (out_features, in_features)
+
+                # Merge: merged = base + lora_B @ lora_A * scaling
+                lora_delta = torch.matmul(lora_b, lora_a) * lora_scaling
+                merged_weight = base_weight + lora_delta
+
+                new_sd[base_weight_key] = merged_weight
+                lora_keys_processed.add(lora_a_key)
+                lora_keys_processed.add(lora_b_key)
+                lora_keys_processed.add(base_weight_key)
+
+                logger.debug(
+                    f"Merged LoRA weights for {base_key}: "
+                    f"base={base_weight.shape}, lora_A={lora_a.shape}, lora_B={lora_b.shape}"
+                )
+
+    # Second pass: copy non-LoRA weights (skip processed LoRA keys)
+    for name, param in input_sd.items():
+        if name not in lora_keys_processed:
+            # Skip orphaned LoRA keys that couldn't be merged
+            if ".lora_A." in name or ".lora_B." in name:
+                logger.warning(f"Skipping orphaned LoRA key: {name}")
+                continue
             new_sd[name] = param
+
+    lora_merged_count = len(lora_keys_processed) // 3  # 3 keys per merge (A, B, base)
+    if lora_merged_count > 0:
+        logger.info(f"Merged {lora_merged_count} LoRA adapter pairs into base weights")
 
     return new_sd
 
@@ -857,7 +905,7 @@ try:
     )
 
     serialization.register_adapter_step(
-        _architecture_name, "split_kv_weights", _split_kv_weights
+        _architecture_name, "merge_lora_weights", _merge_lora_weights
     )
 
     serialization.register_adapter_step(
@@ -865,12 +913,13 @@ try:
     )
 
     # Register complete HF adapter
+    # Pipeline: name conversion -> LoRA merging -> weight fusion
     serialization.register_adapter(
         _architecture_name,
         "hf",
         [
             "hf_to_fms_names",
-            "split_kv_weights",
+            "merge_lora_weights",
             "weight_fusion",
         ],
     )

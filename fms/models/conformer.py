@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
@@ -146,17 +147,21 @@ class ConformerAttention(nn.Module):
     """
     Multi-head self-attention with Shaw's relative positional embeddings.
 
-    Uses relative positional encodings instead of absolute positions:
-        - Computes attention scores with relative position bias
-        - Enables better generalization to variable-length sequences
+    Uses chunked/blocked attention matching HuggingFace's implementation:
+        - Splits sequence into blocks of context_size
+        - Processes all blocks in parallel
+        - Uses relative positional encodings within each block
 
-    Reference: "Self-Attention with Relative Position Representations" (Shaw et al., 2018)
+    Reference:
+        - "Self-Attention with Relative Position Representations" (Shaw et al., 2018)
+        - HuggingFace transformers/models/granite_speech/modeling_granite_speech.py
 
     Args:
         dim: Input dimension
         num_heads: Number of attention heads
         dim_head: Dimension per head
         max_pos_emb: Maximum relative position distance
+        context_size: Block size for chunked attention
         dropout: Dropout probability
     """
 
@@ -165,7 +170,8 @@ class ConformerAttention(nn.Module):
         dim: int,
         num_heads: int = 8,
         dim_head: int = 64,
-        max_pos_emb: int = 1000,
+        max_pos_emb: int = 512,
+        context_size: int = 200,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -174,27 +180,30 @@ class ConformerAttention(nn.Module):
         self.dim_head = dim_head
         self.inner_dim = num_heads * dim_head
         self.max_pos_emb = max_pos_emb
+        self.context_size = context_size
         self.dropout_prob = dropout
         self.scale = dim_head ** -0.5
+
+        if context_size <= 0 or context_size > max_pos_emb:
+            raise ValueError("Context size is either less than 0 or exceeds the max_pos_emb")
 
         # Layer normalization
         self.norm = nn.LayerNorm(dim)
 
-        # Query, Key, Value projections
+        # Query projection
         self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
-        self.to_k = nn.Linear(dim, self.inner_dim, bias=False)
-        self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
+        # Combined Key-Value projection (matches HF's to_kv)
+        self.to_kv = nn.Linear(dim, self.inner_dim * 2, bias=False)
 
         # Relative positional embeddings (learnable)
         # Embedding size: 2*max_pos_emb + 1 (for positions from -max_pos_emb to +max_pos_emb)
         self.pos_emb = nn.Embedding(2 * max_pos_emb + 1, dim_head)
 
-        # Output projection
+        # Output projection (with bias to match HF)
         self.to_out = nn.Linear(self.inner_dim, dim)
 
-        # Dropout layers
-        self.attn_dropout = nn.Dropout(dropout)
-        self.out_dropout = nn.Dropout(dropout)
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -202,61 +211,75 @@ class ConformerAttention(nn.Module):
         attention_dists: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass with relative positional attention.
+        Forward pass with chunked relative positional attention.
+
+        Matches HuggingFace's GraniteSpeechConformerAttention implementation:
+        - Splits input into blocks of context_size
+        - Computes attention within each block independently
+        - Uses Shaw's relative positional embeddings
 
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
             attention_dists: Precomputed relative position indices
-                             of shape (seq_len, seq_len)
+                             of shape (context_size, context_size)
                              Values are in range [0, 2*max_pos_emb]
 
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        batch, seq_len, _ = x.shape
-
         # Apply layer normalization
         x = self.norm(x)
+        bsz, num_features, _ = x.shape
 
-        # 1. Project to Q, K, V
-        q = self.to_q(x)  # (batch, seq_len, inner_dim)
-        k = self.to_k(x)  # (batch, seq_len, inner_dim)
-        v = self.to_v(x)  # (batch, seq_len, inner_dim)
+        # Calculate number of blocks and handle padding
+        num_blocks = math.ceil(num_features / self.context_size)
+        remainder = num_features % self.context_size
+        if remainder > 0:
+            # Right padding to reach block size
+            x = F.pad(x, (0, 0, 0, self.context_size - remainder))
 
-        # 2. Reshape for multi-head attention
-        q = q.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
-        k = k.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
-        v = v.view(batch, seq_len, self.num_heads, self.dim_head).transpose(1, 2)  # (batch, heads, seq_len, dim_head)
+        # Project to Q, K, V
+        query_states = self.to_q(x)
+        key_states, value_states = self.to_kv(x).chunk(2, dim=-1)
 
-        # 3. Compute attention scores with relative positional bias
-        # Standard attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (batch, heads, seq_len, seq_len)
+        # Reshape for blocked multi-head attention
+        # (bsz, padded_seq, inner_dim) -> (bsz, num_blocks, context_size, num_heads, dim_head) -> (bsz, num_blocks, num_heads, context_size, dim_head)
+        query_states = query_states.reshape(bsz, num_blocks, self.context_size, self.num_heads, -1).transpose(2, 3)
+        key_states = key_states.reshape(bsz, num_blocks, self.context_size, self.num_heads, -1).transpose(2, 3)
+        value_states = value_states.reshape(bsz, num_blocks, self.context_size, self.num_heads, -1).transpose(2, 3)
 
-        # Add relative positional bias
-        # Get positional embeddings for the current sequence
-        pos_emb = self.pos_emb(attention_dists[:seq_len, :seq_len])  # (seq_len, seq_len, dim_head)
+        # Shaw's relative positional embedding
+        # attention_dists shape: (context_size, context_size)
+        rel_pos_emb = self.pos_emb(attention_dists)  # (context_size, context_size, dim_head)
 
-        # Compute positional bias: Q * pos_emb^T
-        # q shape: (batch, heads, seq_len, dim_head)
-        # pos_emb shape: (seq_len, seq_len, dim_head)
-        # We want: (batch, heads, seq_len, seq_len)
-        pos_bias = torch.einsum('bhid,ijd->bhij', q, pos_emb) * self.scale
+        # Compute positional attention bias
+        # query_states: (bsz, num_blocks, num_heads, context_size, dim_head)
+        # rel_pos_emb: (context_size, context_size, dim_head)
+        # output: (bsz, num_blocks, num_heads, context_size, context_size)
+        pos_attn = torch.einsum("b m h c d, c r d -> b m h c r", query_states, rel_pos_emb) * self.scale
 
-        attn_scores = attn_scores + pos_bias
+        # Apply masking for padded positions in the last block
+        if remainder > 0:
+            # Create mask: True for positions that should be masked (invalid)
+            mask = torch.ones(self.context_size, self.context_size, dtype=torch.bool, device=x.device)
+            mask[:remainder, :remainder] = False
+            mask_value = -torch.finfo(pos_attn.dtype).max
+            # Only apply mask to the last block
+            pos_attn[:, -1, :].masked_fill_(mask, mask_value)
 
-        # 4. Apply softmax and dropout
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        # Use scaled_dot_product_attention with positional bias as attention mask
+        # This matches HF's implementation exactly
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            out = F.scaled_dot_product_attention(
+                query_states, key_states, value_states, attn_mask=pos_attn, scale=self.scale
+            )
 
-        # 5. Apply attention to values
-        out = torch.matmul(attn_weights, v)  # (batch, heads, seq_len, dim_head)
+        # Reshape back: (bsz, num_blocks, num_heads, context_size, dim_head) -> (bsz, padded_seq, inner_dim)
+        out = out.transpose(2, 3).reshape(bsz, x.shape[1], -1)
 
-        # 6. Reshape and project output
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.inner_dim)  # (batch, seq_len, inner_dim)
-        out = self.to_out(out)  # (batch, seq_len, dim)
-        out = self.out_dropout(out)
-
-        return out
+        # Remove padding and project output
+        out = self.to_out(out[:, :num_features, :])
+        return self.dropout(out)
 
 
 class ConformerConvModule(nn.Module):
@@ -424,12 +447,13 @@ class ConformerBlock(nn.Module):
             activation=config.activation,
         )
 
-        # 2. Multi-head attention module
+        # 2. Multi-head attention module (with chunked/blocked attention)
         self.attn = ConformerAttention(
             dim=config.hidden_dim,
             num_heads=config.num_heads,
             dim_head=config.dim_head,
             max_pos_emb=config.max_pos_emb,
+            context_size=config.context_size,
             dropout=config.dropout,
         )
 
@@ -538,7 +562,8 @@ class ConformerEncoder(nn.Module):
             self.out_mid = None
 
         # Precompute relative position distances for attention
-        attention_dists = self._precompute_attention_dists(max_seq_len=5000)
+        # Use context_size x context_size buffer to match HF's implementation
+        attention_dists = self._precompute_attention_dists()
         self.register_buffer("attention_dists", attention_dists)
 
     @classmethod
@@ -548,37 +573,32 @@ class ConformerEncoder(nn.Module):
     def get_config(self) -> ConformerConfig:
         return self.config
 
-    def _precompute_attention_dists(self, max_seq_len: int = 5000) -> torch.Tensor:
+    def _precompute_attention_dists(self) -> torch.Tensor:
         """
-        Precompute relative position distance matrix for attention.
+        Precompute relative position distance matrix for chunked attention.
 
-        Computes pairwise distances between sequence positions:
+        Computes pairwise distances within a context_size block:
             dist[i, j] = clamp(i - j, -context_size, context_size) + max_pos_emb
 
-        This converts relative distances to indices for embedding lookup.
-
-        Args:
-            max_seq_len: Maximum sequence length to precompute
+        This matches HuggingFace's GraniteSpeechCTCEncoder attention_dists computation.
 
         Returns:
-            Distance matrix of shape (max_seq_len, max_seq_len) with values in [0, 2*max_pos_emb]
+            Distance matrix of shape (context_size, context_size) with values in [0, 2*max_pos_emb]
         """
-        # 1. Create position indices: [0, 1, 2, ..., max_seq_len-1]
-        positions = torch.arange(max_seq_len)
+        context_size = self.config.context_size
+        max_pos_emb = self.config.max_pos_emb
 
-        # 2. Compute pairwise differences: pos[i] - pos[j]
-        # Using broadcasting: (max_seq_len, 1) - (1, max_seq_len) = (max_seq_len, max_seq_len)
-        relative_dists = positions.unsqueeze(0) - positions.unsqueeze(1)
+        # Create position indices: [0, 1, 2, ..., context_size-1]
+        seq = torch.arange(context_size)
 
-        # 3. Clamp to [-context_size, context_size]
-        relative_dists = torch.clamp(
-            relative_dists,
-            min=-self.config.context_size,
-            max=self.config.context_size
-        )
+        # Compute pairwise differences: seq[i] - seq[j] (row - col = i - j)
+        # seq.view(-1, 1) gives (context_size, 1)
+        # seq.view(1, -1) gives (1, context_size)
+        # Result: (context_size, context_size) where result[i, j] = i - j
+        relpos_dist = seq.view(-1, 1) - seq.view(1, -1)
 
-        # 4. Shift by max_pos_emb to get indices in [0, 2*max_pos_emb]
-        attention_dists = relative_dists + self.config.max_pos_emb
+        # Clamp to [-context_size, context_size] and shift by max_pos_emb
+        attention_dists = torch.clamp(relpos_dist, -context_size, context_size) + max_pos_emb
 
         return attention_dists.long()
 
@@ -588,7 +608,7 @@ class ConformerEncoder(nn.Module):
 
         Args:
             input_features: Audio features of shape (batch, seq_len, num_features)
-                          Expected: (batch, seq_len, 80) for 80 log-mel features
+                          Expected: (batch, seq_len, 160) for 80 log-mel * 2 features
 
         Returns:
             hidden_states: Acoustic embeddings of shape (batch, seq_len, hidden_dim)
@@ -606,14 +626,9 @@ class ConformerEncoder(nn.Module):
         # 2. Project input: (batch, seq_len, num_features) -> (batch, seq_len, hidden_dim)
         x = self.input_proj(input_features)
 
-        # 3. Extract attention_dists for current sequence length
-        # If sequence is longer than precomputed, we'll handle it
-        if seq_len > self.attention_dists.size(0):
-            # Dynamically compute for longer sequences
-            attention_dists = self._precompute_attention_dists(max_seq_len=seq_len)
-            attention_dists = attention_dists.to(input_features.device)
-        else:
-            attention_dists = self.attention_dists
+        # 3. Use precomputed attention_dists (context_size x context_size)
+        # The chunked attention in ConformerAttention will use this for all blocks
+        attention_dists = self.attention_dists
 
         # 4. Pass through all Conformer blocks with optional mid-layer CTC
         # Reference: HF modeling_granite_speech.py:270-278
@@ -698,10 +713,10 @@ def _hf_to_fms_names(input_sd: Mapping[str, Any], **kwargs) -> Mapping[str, Any]
         (r"\.ff2\.down_proj\.", ".ff2.fc2."),
 
         # Attention module
+        # Note: HF uses combined to_kv, FMS now also uses to_kv (no split needed)
         (r"\.attn\.pre_norm\.", ".attn.norm."),
         (r"\.attn\.to_q\.", ".attn.to_q."),
-        (r"\.attn\.to_k\.", ".attn.to_k."),
-        (r"\.attn\.to_v\.", ".attn.to_v."),
+        (r"\.attn\.to_kv\.", ".attn.to_kv."),
         (r"\.attn\.to_out\.", ".attn.to_out."),
         (r"\.attn\.rel_pos_emb\.", ".attn.pos_emb."),
 
