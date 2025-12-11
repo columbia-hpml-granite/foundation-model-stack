@@ -5,8 +5,8 @@ from fms.models import get_model
 from fms.utils import serialization
 
 
-MODEL_ID = "ibm-granite/granite-speech-3.2-8b"  # adjust if needed
-FMS_VARIANT = "3.2-8b" # must match the FMS registry
+MODEL_ID = "ibm-granite/granite-speech-3.3-2b"  # Using 3.3-2b as 3.2-8b uses unregistered granite_speech_qformer
+FMS_VARIANT = "3.3-2b"  # must match the FMS registry
 
 
 def _require_deps():
