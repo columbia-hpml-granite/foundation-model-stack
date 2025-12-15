@@ -69,7 +69,7 @@ _default_encoder_config = ConformerConfig(
     dropout=0.1,              # HF: dropout
     max_pos_emb=512,          # HF: max_pos_emb
     context_size=200,         # HF: context_size
-    output_dim=42,            # HF: output_dim (CTC output dimension)
+    output_dim=256,           # HF: output_dim (CTC output dimension)
 )
 
 # Projector config matching HF Blip2QFormerConfig used in granite_speech
@@ -96,9 +96,9 @@ _default_decoder_config = GraniteConfig(
     head_dim=128,
     kvheads=8,
     nlayers=40,
-    hidden_grow_factor=14336 / 4096,  # ~3.5
+    hidden_grow_factor=12800 / 4096,  # ~3.125 (intermediate_size / hidden_size)
     max_expected_seq_len=8192,
-    rope_theta=10000.0,
+    rope_theta=10000000.0,  # 10M (from HF text_config)
     pad_id=0,
     p_dropout=0.0,
     tie_heads=False,
