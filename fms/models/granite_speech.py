@@ -87,7 +87,7 @@ _default_projector_config = SpeechProjectorConfig(
     initializer_range=0.02,
 )
 
-# Decoder config for Granite 8B (simplified - actual values from model)
+# Decoder config for Granite 8B (matching HF granite-speech-3.3-8b text_config)
 _default_decoder_config = GraniteConfig(
     src_vocab_size=49160,
     emb_dim=4096,
@@ -97,7 +97,7 @@ _default_decoder_config = GraniteConfig(
     kvheads=8,
     nlayers=40,
     hidden_grow_factor=12800 / 4096,  # ~3.125 (intermediate_size / hidden_size)
-    max_expected_seq_len=8192,
+    max_expected_seq_len=131072,  # HF: max_position_embeddings
     rope_theta=10000000.0,  # 10M (from HF text_config)
     pad_id=0,
     p_dropout=0.0,
@@ -160,9 +160,9 @@ class GraniteSpeechConfig(ModelConfig):
     )
 
     # Audio token settings (from HF GraniteSpeechConfig)
-    # HF default: 49155 (configuration_granite_speech.py:164)
+    # HF granite-speech-3.3-8b: audio_token_index=49159
     # HF uses `audio_token_id` as alias (attribute_map in config)
-    audio_token_index: int = 49155
+    audio_token_index: int = 49159
     has_lora_adapter: bool = True
 
     # Projector window settings (from HF)
