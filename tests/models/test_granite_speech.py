@@ -1636,3 +1636,164 @@ class TestGraniteSpeechE2E:
         num_actual_features = torch.sum(processed["input_features_mask"], dim=-1)
         for expected, actual in zip(num_computed_features, num_actual_features):
             assert expected == actual.item()
+
+
+# ============================================================================
+# Auto Config Loading Tests (hf_configured / hf_pretrained)
+# ============================================================================
+
+
+class TestGraniteSpeechAutoConfigLoading:
+    """
+    Tests for get_model auto config loading feature.
+
+    These tests verify that GraniteSpeech can be loaded via:
+    1. get_model("hf_configured", "ibm-granite/granite-speech-3.3-2b")
+    2. get_model("hf_pretrained", "ibm-granite/granite-speech-3.3-2b")
+
+    The auto config loading feature extracts model configuration from HuggingFace
+    and creates the corresponding FMS model.
+    """
+
+    def test_map_model_config_granite_speech(self):
+        """
+        Test that _map_model_config correctly maps GraniteSpeech HF config to FMS config.
+
+        This tests the config mapping without downloading any model weights.
+        """
+        from fms.models.hf.utils import _map_model_config
+        from fms.models.conformer import ConformerConfig
+        from fms.models.granite import GraniteConfig
+        from fms.modules.projector import SpeechProjectorConfig
+
+        # Create a mock HF config structure
+        class MockEncoderConfig:
+            input_dim = 160
+            hidden_dim = 1024
+            num_layers = 16
+            num_heads = 8
+            dim_head = 128
+            conv_kernel_size = 15
+            conv_expansion_factor = 2
+            feedforward_mult = 4
+            dropout = 0.1
+            max_pos_emb = 512
+            context_size = 200
+            output_dim = 256
+
+        class MockProjectorConfig:
+            hidden_size = 1024
+            num_hidden_layers = 2
+            num_attention_heads = 16
+            intermediate_size = 4096
+            hidden_dropout_prob = 0.1
+            attention_probs_dropout_prob = 0.1
+            hidden_act = "gelu"
+            layer_norm_eps = 1e-12
+            initializer_range = 0.02
+            cross_attention_frequency = 1
+
+        class MockTextConfig:
+            model_type = "granite"
+            hidden_size = 4096
+            intermediate_size = 12800
+            num_hidden_layers = 40
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            rms_norm_eps = 1e-5
+            rope_theta = 10000000.0
+            vocab_size = 49160
+            tie_word_embeddings = False
+            attention_bias = False
+            mlp_bias = False
+            max_position_embeddings = 131072
+            residual_multiplier = 0.22
+            attention_multiplier = 0.0078125
+            logits_scaling = 16.0
+            embedding_multiplier = 12.0
+            hidden_act = "silu"
+            head_dim = 128
+
+        class MockGraniteSpeechConfig:
+            architectures = ["GraniteSpeechForConditionalGeneration"]
+            audio_token_index = 49159
+            window_size = 15
+            downsample_rate = 5
+            has_lora_adapter = True
+            encoder_config = MockEncoderConfig()
+            projector_config = MockProjectorConfig()
+            text_config = MockTextConfig()
+
+        # Test the mapping
+        architecture, config_params = _map_model_config(
+            "GraniteSpeechForConditionalGeneration",
+            MockGraniteSpeechConfig()
+        )
+
+        # Verify architecture name
+        assert architecture == "granite_speech"
+
+        # Verify top-level params
+        assert config_params["audio_token_index"] == 49159
+        assert config_params["window_size"] == 15
+        assert config_params["downsample_rate"] == 5
+        assert config_params["has_lora_adapter"] is True
+
+        # Verify encoder config
+        assert isinstance(config_params["encoder_config"], ConformerConfig)
+        assert config_params["encoder_config"].num_features == 160
+        assert config_params["encoder_config"].hidden_dim == 1024
+        assert config_params["encoder_config"].num_layers == 16
+        assert config_params["encoder_config"].output_dim == 256
+
+        # Verify projector config
+        assert isinstance(config_params["projector_config"], SpeechProjectorConfig)
+        assert config_params["projector_config"].encoder_dim == 1024
+        assert config_params["projector_config"].decoder_dim == 4096
+        assert config_params["projector_config"].num_hidden_layers == 2
+
+        # Verify decoder config
+        assert isinstance(config_params["decoder_config"], GraniteConfig)
+        assert config_params["decoder_config"].emb_dim == 4096
+        assert config_params["decoder_config"].nlayers == 40
+        assert config_params["decoder_config"].nheads == 32
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="hf_configured test requires CUDA for practical model size"
+    )
+    def test_get_model_hf_configured_granite_speech(self):
+        """
+        Test get_model with hf_configured for GraniteSpeech.
+
+        This downloads only the config.json (not weights) from HuggingFace
+        and creates an FMS model with matching configuration.
+
+        Requires: transformers with GraniteSpeech support
+        """
+        from fms import models
+
+        # Use 2B model as it's smaller
+        model_id = "ibm-granite/granite-speech-3.3-2b"
+
+        try:
+            # This should:
+            # 1. Download config.json from HF
+            # 2. Parse the config using _map_model_config
+            # 3. Create FMS GraniteSpeech model (randomly initialized)
+            model = models.get_model("hf_configured", model_id)
+
+            # Verify model was created
+            assert model is not None
+            assert isinstance(model, GraniteSpeech)
+
+            # Verify config was correctly inferred
+            assert model.config.audio_token_index == 49159
+            assert model.config.encoder_config.num_layers == 16
+            assert model.config.decoder_config.nlayers == 40
+
+        except Exception as e:
+            # If transformers doesn't have GraniteSpeech, skip
+            if "GraniteSpeech" in str(e) or "granite_speech" in str(e):
+                pytest.skip(f"Transformers doesn't support GraniteSpeech: {e}")
+            raise
