@@ -1541,6 +1541,7 @@ class TestGraniteSpeechE2E:
     def test_fms_model_forward_text_only(self, small_config):
         """Test FMS GraniteSpeech model forward pass with text only."""
         model = GraniteSpeech(small_config)
+        model.reset_parameters()
         model.eval()
 
         batch_size = 2
@@ -1558,6 +1559,7 @@ class TestGraniteSpeechE2E:
     def test_fms_model_forward_with_audio(self, small_config):
         """Test FMS GraniteSpeech model forward pass with audio features."""
         model = GraniteSpeech(small_config)
+        model.reset_parameters()
         model.eval()
 
         batch_size = 1
@@ -1677,6 +1679,7 @@ class TestGraniteSpeechE2E:
         # Create model with matching config
         # Update config to have enough vocab for our mock tokenizer
         model = GraniteSpeech(small_config)
+        model.reset_parameters()
         model.eval()
 
         # Create input_ids with correct number of audio tokens
