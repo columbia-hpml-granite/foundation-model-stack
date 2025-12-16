@@ -216,6 +216,7 @@ class GraniteSpeech(nn.Module):
         return self.lm_head
 
     def get_audio_features(self, input_features: torch.Tensor) -> torch.Tensor:
+        input_features = input_features.to(dtype=self.encoder.input_proj.weight.dtype)
         encoder_embeds = self.encoder(input_features)
         projected_embeds = self.projector(encoder_embeds)
         return projected_embeds
