@@ -264,6 +264,7 @@ def test_granite_speech_2b_generation_equivalence():
             max_new_tokens=100,
             do_sample=False,
             use_cache=True,
+            prepare_model_inputs_hook=fms_model.prepare_inputs_for_generation,
             extra_kwargs=extra_kwargs,
         )
 
@@ -321,6 +322,7 @@ def test_granite_speech_8b_generation_equivalence():
             max_new_tokens=100,
             do_sample=False,
             use_cache=True,
+            prepare_model_inputs_hook=fms_model.prepare_inputs_for_generation,
             extra_kwargs=extra_kwargs,
         )
 
