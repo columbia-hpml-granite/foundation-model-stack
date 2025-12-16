@@ -198,6 +198,7 @@ class GraniteSpeech(nn.Module):
 
     def reset_parameters(self):
         nn.init.normal_(self.lm_head.weight, std=self.config.initializer_range)
+        self.decoder.reset_parameters()
 
     def post_init(self):
         self.encoder._recompute_buffers()

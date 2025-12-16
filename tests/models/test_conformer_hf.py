@@ -213,9 +213,9 @@ class TestAttentionDistances:
     def test_attention_dists_shape(self, small_config):
         """Test precomputed attention distances have correct shape."""
         encoder = ConformerEncoder(small_config)
-        # Default precomputation is for max_seq_len=5000
-        assert encoder.attention_dists.shape[0] == 5000
-        assert encoder.attention_dists.shape[1] == 5000
+        # Shape is (context_size, context_size) for chunked attention
+        assert encoder.attention_dists.shape[0] == small_config.context_size
+        assert encoder.attention_dists.shape[1] == small_config.context_size
 
     def test_attention_dists_clamping(self, small_config):
         """Test attention distances are clamped correctly."""
