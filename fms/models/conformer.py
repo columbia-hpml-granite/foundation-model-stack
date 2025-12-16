@@ -581,9 +581,11 @@ class ConformerEncoder(nn.Module):
         This method should be called from post_init() after the model has been
         transferred to a real device to ensure buffers contain valid values.
         """
-        if self.attention_dists.device.type != "meta":
+        # Get device from an existing parameter (input_proj is always present)
+        device = next(self.parameters()).device
+        if device.type != "meta":
             # Only recompute if we're on a real device now
-            attention_dists = self._precompute_attention_dists()
+            attention_dists = self._precompute_attention_dists(device)
             self.register_buffer("attention_dists", attention_dists, persistent=False)
 
     @classmethod
@@ -593,7 +595,7 @@ class ConformerEncoder(nn.Module):
     def get_config(self) -> ConformerConfig:
         return self.config
 
-    def _precompute_attention_dists(self) -> torch.Tensor:
+    def _precompute_attention_dists(self, device: torch.device = None) -> torch.Tensor:
         """
         Precompute relative position distance matrix for chunked attention.
 
@@ -602,6 +604,9 @@ class ConformerEncoder(nn.Module):
 
         This matches HuggingFace's GraniteSpeechCTCEncoder attention_dists computation.
 
+        Args:
+            device: Target device for the tensor. If None, uses CPU (for initial creation).
+
         Returns:
             Distance matrix of shape (context_size, context_size) with values in [0, 2*max_pos_emb]
         """
@@ -609,7 +614,7 @@ class ConformerEncoder(nn.Module):
         max_pos_emb = self.config.max_pos_emb
 
         # Create position indices: [0, 1, 2, ..., context_size-1]
-        seq = torch.arange(context_size)
+        seq = torch.arange(context_size, device=device)
 
         # Compute pairwise differences: seq[i] - seq[j] (row - col = i - j)
         # seq.view(-1, 1) gives (context_size, 1)
