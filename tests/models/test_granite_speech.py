@@ -616,6 +616,123 @@ class TestGraniteSpeechModel:
         assert logits is not None
         assert not torch.isnan(logits).any().item(), "FP16 autocast forward produced NaN values"
 
+    def test_granite_speech_model_bfloat16_forward(self, model_tester):
+        """Test bfloat16 forward pass for GraniteSpeech model.
+
+        Verifies that the model produces valid (non-NaN) logits when
+        running in bfloat16 precision. bfloat16 has a larger dynamic range
+        than float16 and is often more stable for training.
+
+        Note: This test runs on CPU (bfloat16 is supported on CPU unlike FP16).
+        """
+        import math
+
+        config, inputs_dict = model_tester.prepare_config_and_inputs_for_common()
+
+        model = GraniteSpeech(config)
+        model.to(torch.bfloat16)
+        model.eval()
+
+        # Initialize weights with small values for stability
+        torch.manual_seed(42)
+        sd = model.state_dict()
+        for key in sd.keys():
+            param = sd[key]
+            if param.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                continue
+            if "running_mean" in key or "running_var" in key:
+                continue
+            # Use smaller values for stability
+            values = torch.randn_like(param) * 0.01
+            param.copy_(values)
+
+        # Calculate correct number of audio tokens
+        window_size = model_tester.window_size
+        num_queries = model_tester.projector_config.num_queries
+        num_windows = math.ceil(model_tester.sequence_dim / window_size)
+        actual_num_audio_tokens = num_windows * num_queries
+
+        # Create input_ids with correct number of audio tokens
+        batch_size = model_tester.batch_size
+        seq_length = model_tester.seq_len + actual_num_audio_tokens
+        input_ids = torch.randint(
+            2, config.decoder_config.src_vocab_size,
+            (batch_size, seq_length)
+        )
+        input_ids[:, :actual_num_audio_tokens] = config.audio_token_index
+
+        input_features = inputs_dict["input_features"].to(torch.bfloat16)
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long)
+
+        with torch.no_grad():
+            logits, _ = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                input_features=input_features,
+            )
+
+        assert logits is not None
+        assert logits.dtype == torch.bfloat16, f"Expected bfloat16 logits, got {logits.dtype}"
+        assert not torch.isnan(logits).any().item(), "bfloat16 forward produced NaN values"
+
+    def test_granite_speech_model_bfloat16_autocast_forward(self, model_tester):
+        """Test bfloat16 autocast forward pass for GraniteSpeech model.
+
+        Verifies that the model produces valid (non-NaN) logits when
+        running with torch.autocast in bfloat16 precision.
+
+        Note: bfloat16 autocast works on both CPU and CUDA.
+        """
+        import math
+
+        config, inputs_dict = model_tester.prepare_config_and_inputs_for_common()
+
+        model = GraniteSpeech(config)
+        # Keep model in float32, autocast will handle conversion
+        model.eval()
+
+        # Initialize weights with small values for stability
+        torch.manual_seed(42)
+        sd = model.state_dict()
+        for key in sd.keys():
+            param = sd[key]
+            if param.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                continue
+            if "running_mean" in key or "running_var" in key:
+                continue
+            values = torch.randn_like(param) * 0.01
+            param.copy_(values)
+
+        # Calculate correct number of audio tokens
+        window_size = model_tester.window_size
+        num_queries = model_tester.projector_config.num_queries
+        num_windows = math.ceil(model_tester.sequence_dim / window_size)
+        actual_num_audio_tokens = num_windows * num_queries
+
+        # Create input_ids with correct number of audio tokens
+        batch_size = model_tester.batch_size
+        seq_length = model_tester.seq_len + actual_num_audio_tokens
+        input_ids = torch.randint(
+            2, config.decoder_config.src_vocab_size,
+            (batch_size, seq_length)
+        )
+        input_ids[:, :actual_num_audio_tokens] = config.audio_token_index
+
+        input_features = inputs_dict["input_features"]
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long)
+
+        # Use CPU autocast with bfloat16 (works without GPU)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            with torch.no_grad():
+                logits, _ = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    input_features=input_features,
+                )
+
+        assert logits is not None
+        assert not torch.isnan(logits).any().item(), "bfloat16 autocast forward produced NaN values"
+
 
 # =============================================================================
 # FMS Native Feature Extractor and Processor Tests
@@ -1797,3 +1914,331 @@ class TestGraniteSpeechAutoConfigLoading:
             if "GraniteSpeech" in str(e) or "granite_speech" in str(e):
                 pytest.skip(f"Transformers doesn't support GraniteSpeech: {e}")
             raise
+
+    def test_get_model_direct_variant_2b(self):
+        """
+        Test get_model with architecture + variant for 2B model.
+
+        This tests direct variant loading without HF download, using the
+        registered variant configuration.
+        """
+        from fms.models import get_model, list_variants
+
+        # Verify variant is registered
+        variants = list_variants("granite_speech")
+        assert "3.3-2b" in variants, f"3.3-2b not in registered variants: {variants}"
+
+        # Load model with direct variant
+        model = get_model(
+            architecture="granite_speech",
+            variant="3.3-2b",
+            device_type="cpu",
+        )
+
+        # Verify model was created
+        assert model is not None
+        assert isinstance(model, GraniteSpeech)
+
+        # Verify config matches expected 2B configuration
+        config = model.get_config()
+        assert config.encoder_config.num_layers == 16
+        assert config.decoder_config.nlayers == 40
+        assert config.decoder_config.emb_dim == 2048  # 2B model embedding dim
+
+    def test_get_model_direct_variant_8b(self):
+        """
+        Test get_model with architecture + variant for 8B model.
+
+        This tests direct variant loading for the larger model variant.
+        """
+        from fms.models import get_model, list_variants
+
+        # Verify variant is registered
+        variants = list_variants("granite_speech")
+        assert "3.3-8b" in variants, f"3.3-8b not in registered variants: {variants}"
+
+        # Load model with direct variant
+        model = get_model(
+            architecture="granite_speech",
+            variant="3.3-8b",
+            device_type="cpu",
+        )
+
+        # Verify model was created
+        assert model is not None
+        assert isinstance(model, GraniteSpeech)
+
+        # Verify config matches expected 8B configuration
+        config = model.get_config()
+        assert config.encoder_config.num_layers == 16
+        assert config.decoder_config.nlayers == 40
+        assert config.decoder_config.emb_dim == 4096  # 8B model embedding dim
+
+    def test_get_model_invalid_variant_raises(self):
+        """
+        Test that get_model raises KeyError for invalid variant.
+
+        Verifies proper error handling when a non-existent variant is requested.
+        """
+        from fms.models import get_model
+
+        with pytest.raises(KeyError) as exc_info:
+            get_model(
+                architecture="granite_speech",
+                variant="invalid-nonexistent-variant",
+                device_type="cpu",
+            )
+
+        # Verify error message mentions the invalid variant
+        assert "invalid-nonexistent-variant" in str(exc_info.value)
+
+    def test_get_model_hf_pretrained_conflicting_params_raises(self):
+        """
+        Test that hf_pretrained with both variant and model_path raises ValueError.
+
+        The hf_pretrained architecture requires exactly one of variant or model_path,
+        not both simultaneously.
+        """
+        from fms.models import get_model
+
+        with pytest.raises(ValueError) as exc_info:
+            get_model(
+                architecture="hf_pretrained",
+                variant="ibm-granite/granite-speech-3.3-2b",
+                model_path="/some/nonexistent/path",
+                device_type="cpu",
+            )
+
+        # Verify error message explains the conflict
+        error_msg = str(exc_info.value)
+        assert "variant" in error_msg.lower() or "model_path" in error_msg.lower()
+
+
+# =============================================================================
+# CPU-Only Tests (no CUDA requirement)
+# =============================================================================
+
+
+class TestGraniteSpeechCPU:
+    """
+    Tests for GraniteSpeech that run on CPU without CUDA requirement.
+
+    These tests enable CI/CD on CPU-only machines and verify that the model
+    works correctly without GPU acceleration.
+    """
+
+    @pytest.fixture
+    def small_cpu_config(self):
+        """Create a small config optimized for CPU testing."""
+        encoder_config = ConformerConfig(
+            num_features=160,
+            hidden_dim=64,
+            num_layers=2,
+            num_heads=4,
+            dim_head=16,
+            conv_kernel_size=15,
+            conv_expansion_factor=2,
+            feedforward_mult=4,
+            dropout=0.0,
+            output_dim=42,
+        )
+
+        decoder_config = GraniteConfig(
+            src_vocab_size=1000,
+            emb_dim=64,
+            nlayers=2,
+            nheads=4,
+            hidden_grow_factor=2.0,
+            max_expected_seq_len=256,
+            pad_id=0,
+        )
+
+        projector_config = SpeechProjectorConfig(
+            encoder_dim=64,
+            decoder_dim=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=128,
+            window_size=15,
+            downsample_rate=5,
+            num_queries=3,
+        )
+
+        return GraniteSpeechConfig(
+            encoder_config=encoder_config,
+            decoder_config=decoder_config,
+            projector_config=projector_config,
+            audio_token_index=999,
+            downsample_rate=5,
+            window_size=15,
+        )
+
+    def _init_model_weights(self, model):
+        """Initialize model weights with small values for stability."""
+        torch.manual_seed(42)
+        sd = model.state_dict()
+        for key in sd.keys():
+            param = sd[key]
+            if param.dtype in (torch.long, torch.int, torch.int32, torch.int64):
+                continue
+            if "running_mean" in key or "running_var" in key:
+                continue
+            # Use smaller values for stability
+            values = torch.randn_like(param) * 0.01
+            param.copy_(values)
+
+    def test_forward_pass_cpu_text_only(self, small_cpu_config):
+        """Test text-only forward pass works on CPU."""
+        model = GraniteSpeech(small_cpu_config)
+        self._init_model_weights(model)
+        model.eval()
+
+        batch_size = 2
+        seq_len = 20
+
+        # Text-only input (no audio tokens)
+        input_ids = torch.randint(1, 998, (batch_size, seq_len))
+
+        with torch.no_grad():
+            logits, loss = model(input_ids=input_ids)
+
+        assert logits is not None
+        assert logits.shape == (batch_size, seq_len, small_cpu_config.decoder_config.src_vocab_size)
+        assert loss is None  # No labels provided
+        assert not torch.isnan(logits).any().item(), "CPU forward produced NaN values"
+
+    def test_forward_pass_cpu_with_audio(self, small_cpu_config):
+        """Test forward pass with audio features works on CPU."""
+        import math
+
+        model = GraniteSpeech(small_cpu_config)
+        self._init_model_weights(model)
+        model.eval()
+
+        batch_size = 1
+        audio_len = 45  # Multiple of window_size (15)
+
+        # Calculate expected audio tokens
+        num_windows = audio_len // small_cpu_config.window_size
+        num_audio_tokens = num_windows * small_cpu_config.projector_config.num_queries
+
+        seq_len = num_audio_tokens + 10  # audio tokens + text tokens
+
+        # Input with audio tokens at the beginning
+        input_ids = torch.randint(1, 998, (batch_size, seq_len))
+        input_ids[0, :num_audio_tokens] = small_cpu_config.audio_token_index
+
+        # Audio features
+        input_features = torch.randn(batch_size, audio_len, 160)
+
+        with torch.no_grad():
+            logits, loss = model(
+                input_ids=input_ids,
+                input_features=input_features,
+            )
+
+        assert logits is not None
+        assert logits.shape == (batch_size, seq_len, small_cpu_config.decoder_config.src_vocab_size)
+        assert not torch.isnan(logits).any().item(), "CPU forward with audio produced NaN values"
+
+    def test_forward_pass_cpu_with_labels(self, small_cpu_config):
+        """Test forward pass with labels computes loss on CPU."""
+        model = GraniteSpeech(small_cpu_config)
+        self._init_model_weights(model)
+        model.eval()
+
+        batch_size = 2
+        seq_len = 20
+
+        input_ids = torch.randint(1, 998, (batch_size, seq_len))
+
+        # Create labels (shifted input_ids for language modeling)
+        labels = input_ids.clone()
+        labels[:, :5] = -100  # Mask first 5 tokens (prompt)
+
+        with torch.no_grad():
+            logits, loss = model(input_ids=input_ids, labels=labels)
+
+        assert logits is not None
+        assert loss is not None
+        assert loss.dim() == 0  # Scalar loss
+        assert not torch.isnan(loss).item(), "CPU loss computation produced NaN"
+
+    def test_get_model_cpu_device(self, small_cpu_config):
+        """Test that get_model with device_type='cpu' works correctly."""
+        from fms.models import get_model
+
+        model = get_model(
+            architecture="granite_speech",
+            variant="3.3-2b",
+            device_type="cpu",
+        )
+
+        # Verify model is on CPU
+        param = next(model.parameters())
+        assert param.device.type == "cpu", f"Expected cpu, got {param.device}"
+
+        # Verify model can do forward pass
+        input_ids = torch.randint(1, 1000, (1, 10))
+        with torch.no_grad():
+            logits, _ = model(input_ids=input_ids)
+
+        assert logits is not None
+        assert logits.device.type == "cpu"
+
+    def test_generation_cpu(self, small_cpu_config):
+        """Test generation works on CPU."""
+        from fms.utils.generation import generate
+
+        model = GraniteSpeech(small_cpu_config)
+        self._init_model_weights(model)
+        model.eval()
+
+        input_ids = torch.randint(1, 998, (1, 10))
+
+        with torch.no_grad():
+            output_ids = generate(
+                model,
+                input_ids,
+                max_new_tokens=5,
+                do_sample=False,
+                use_cache=True,
+            )
+
+        assert output_ids.shape == (1, 15)  # 10 input + 5 generated
+        assert not torch.isnan(output_ids.float()).any().item()
+
+    def test_generation_cpu_with_audio(self, small_cpu_config):
+        """Test generation with audio features works on CPU."""
+        from fms.utils.generation import generate
+
+        model = GraniteSpeech(small_cpu_config)
+        self._init_model_weights(model)
+        model.eval()
+
+        # Setup audio
+        audio_len = 30
+        num_windows = audio_len // small_cpu_config.window_size
+        num_audio_tokens = num_windows * small_cpu_config.projector_config.num_queries
+
+        seq_len = num_audio_tokens + 5
+        input_ids = torch.randint(1, 998, (1, seq_len))
+        input_ids[0, :num_audio_tokens] = small_cpu_config.audio_token_index
+
+        input_features = torch.randn(1, audio_len, 160)
+        input_features_mask = torch.ones(1, audio_len, dtype=torch.bool)
+
+        with torch.no_grad():
+            output_ids = generate(
+                model,
+                input_ids,
+                max_new_tokens=5,
+                do_sample=False,
+                use_cache=True,
+                extra_kwargs={
+                    "input_features": input_features,
+                    "input_features_mask": input_features_mask,
+                },
+            )
+
+        assert output_ids.shape == (1, seq_len + 5)
