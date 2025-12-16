@@ -354,6 +354,17 @@ class GraniteSpeech(nn.Module):
         # meta device transfer. See ConformerEncoder._recompute_buffers() docstring.
         self.encoder._recompute_buffers()
 
+        # Tie lm_head weights to decoder embedding if configured
+        # This is necessary because HF granite-speech uses tie_word_embeddings=True
+        # and the lm_head weights are not stored in the checkpoint.
+        # Reference: fms/models/granite.py:354-361
+        if self.config.decoder_config.tie_heads:
+            # Handle assignment of non-meta weights to meta parameters
+            if self.lm_head.weight.device == torch.device("meta"):
+                self.lm_head.weight = self.decoder.embedding.weight
+            else:
+                self.decoder.embedding.weight = self.lm_head.weight
+
     def get_input_embeddings(self):
         """Get input embeddings from the decoder."""
         return self.decoder.embedding
@@ -481,6 +492,11 @@ class GraniteSpeech(nn.Module):
             Unlike HF which filters loss by attention_mask, FMS relies on labels=-100
             to exclude positions from loss computation (standard CrossEntropyLoss behavior).
         """
+        # Handle past_key_value_states alias (used by fms.utils.generation)
+        # FMS generate() uses past_key_value_states, but HF-style models use past_key_values
+        if past_key_values is None and "past_key_value_states" in kwargs:
+            past_key_values = kwargs.pop("past_key_value_states")
+
         # Check if inputs_embeds is provided via kwargs (from prepare_inputs_for_generation hook)
         # This allows the generation hook to pass pre-computed embeddings
         # Note: If inputs_embeds is in kwargs, Python may have already extracted it to the parameter
@@ -506,7 +522,11 @@ class GraniteSpeech(nn.Module):
     
         # Building embeddings
         if inputs_embeds is None:
-            if input_features is not None:
+            # Check if we need to process audio features
+            # Skip audio if: no input_features, or in continuation mode (no audio token in input_ids)
+            has_audio_token = input_ids is not None and (input_ids == self.audio_token_index).any()
+
+            if input_features is not None and has_audio_token:
                 if input_ids is None:
                     raise ValueError("input_ids are required when using input_features.")
                 # Extracting audio features through encoder + projector
@@ -530,7 +550,7 @@ class GraniteSpeech(nn.Module):
                     input_features_mask=input_features_mask,
                 )
             else:
-                # Text-only
+                # Text-only (or continuation after audio was already processed)
                 inputs_embeds = self.get_input_embeddings()(input_ids)
     
         # Decoder forward
@@ -542,8 +562,9 @@ class GraniteSpeech(nn.Module):
             use_cache=bool(use_cache),
         )
     
-        # LM head
+        # LM head with logits scaling (same as Granite.forward())
         logits = self.lm_head(dec_out)
+        logits = logits / self.config.decoder_config.logits_scaling
     
         # Loss
         loss = None
@@ -733,9 +754,10 @@ def _merge_lora_weights(
     lora_scaling = 0.5
 
     # Pattern to match LoRA weights
-    # Example: decoder.layers.0.attn.in_proj.query.lora_A.default.weight
+    # Example: decoder.layers.0.attn.in_proj.query.lora_A.weight
+    # or: decoder.layers.0.attn.in_proj.query.lora_A.default.weight
     lora_a_pattern = re.compile(
-        r"^(decoder\.layers\.\d+\.attn\.in_proj\.(query|value))\.lora_A\.default\.weight$"
+        r"^(decoder\.layers\.\d+\.attn\.in_proj\.(query|value))\.lora_A(?:\.default)?\.weight$"
     )
 
     # First pass: identify all LoRA pairs and merge them
@@ -924,6 +946,56 @@ def _granite_speech_weight_fusion(
     return new_sd
 
 
+def _hf_to_fms_rope(
+    input_sd: Mapping[str, Any], model_config: Optional[GraniteSpeechConfig] = None, **kwargs
+) -> Mapping[str, Any]:
+    """
+    Transform Q and K weights for RoPE compatibility between HF and FMS.
+
+    HF uses a non-interleaved RoPE implementation where pairs are (x0, x_dim/2),
+    (x1, x_dim/2+1), etc. FMS uses interleaved pairs (x0, x1), (x2, x3), etc.
+
+    To make FMS produce identical outputs when loading HF weights, we need to
+    rearrange the Q and K weights so the combination (transformed weights + FMS RoPE)
+    produces the same output as (HF weights + HF RoPE).
+
+    This transformation must be applied AFTER LoRA merging but BEFORE weight fusion.
+    """
+    new_sd = {}
+
+    if model_config:
+        head_size = model_config.decoder_config.head_dim
+    else:
+        logger.warning("Missing model_config, assuming default head_size=64")
+        head_size = 64
+
+    # Pattern to match Q and K weights (FMS naming after hf_to_fms_names conversion)
+    # Note: K doesn't have LoRA, so no merging needed, but still needs RoPE transformation
+    rope_pattern = re.compile(
+        r"^decoder\.layers\.\d+\.attn\.in_proj\.(query|key)\.weight$"
+    )
+
+    for name, param in input_sd.items():
+        if rope_pattern.match(name) and param.numel() > 1:
+            temp = param  # Shape: (out_features, in_features) = (heads*head_dim, emb_dim)
+            num_heads = temp.size(0) // head_size
+
+            # Transform: reshape to (heads, 2, head_dim/2, in_features), swap dims 1 and 2
+            # This re-interleaves the weights for FMS's RoPE implementation
+            if temp.dim() == 2:  # weight matrix
+                temp_view = temp.view(num_heads, 2, -1, temp.size(1))
+            else:  # 1-dim parameters (bias)
+                temp_view = temp.view(num_heads, 2, -1)
+            temp = temp_view.transpose(1, 2).reshape(*param.size())
+
+            new_sd[name] = temp
+            logger.debug(f"Applied RoPE transformation to {name}")
+        else:
+            new_sd[name] = param
+
+    return new_sd
+
+
 # Register adapter steps
 try:
     from fms.utils import serialization
@@ -937,17 +1009,22 @@ try:
     )
 
     serialization.register_adapter_step(
+        _architecture_name, "hf_to_fms_rope", _hf_to_fms_rope
+    )
+
+    serialization.register_adapter_step(
         _architecture_name, "weight_fusion", _granite_speech_weight_fusion
     )
 
     # Register complete HF adapter
-    # Pipeline: name conversion -> LoRA merging -> weight fusion
+    # Pipeline: name conversion -> LoRA merging -> RoPE transformation -> weight fusion
     serialization.register_adapter(
         _architecture_name,
         "hf",
         [
             "hf_to_fms_names",
             "merge_lora_weights",
+            "hf_to_fms_rope",
             "weight_fusion",
         ],
     )
