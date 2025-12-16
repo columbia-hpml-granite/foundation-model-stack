@@ -350,8 +350,9 @@ class GraniteSpeech(nn.Module):
 
     def post_init(self):
         """Post-initialization hook after model is on correct device."""
-        # Hook left available for optional weight tying or device-specific setup.
-        return
+        # Recompute encoder's non-persistent buffers (attention_dists) after
+        # meta device transfer. See ConformerEncoder._recompute_buffers() docstring.
+        self.encoder._recompute_buffers()
 
     def get_input_embeddings(self):
         """Get input embeddings from the decoder."""
