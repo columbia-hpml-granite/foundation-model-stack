@@ -640,23 +640,22 @@ class GraniteSpeech(nn.Module):
         
         # First iteration with audio: process and merge audio embeddings
         # This matches the logic in forward() method
+
+        # Get audio embeddings from encoder + projector FIRST
+        # (mask validation must be against projected embeddings, not raw features)
+        audio_embeds = self.get_audio_features(input_features)
+
+        # Build mask for projected audio embeddings if not provided
+        # Note: input_features_mask from HF processor is for projected embeddings,
+        # not raw input features. If None, create a full mask.
         if input_features_mask is None:
-            input_features_mask = input_features.new_ones(
-                input_features.shape[:2], dtype=torch.bool
+            input_features_mask = audio_embeds.new_ones(
+                audio_embeds.shape[:2], dtype=torch.bool
             )
         input_features_mask = input_features_mask.to(
-            device=input_features.device, dtype=torch.bool
+            device=audio_embeds.device, dtype=torch.bool
         )
-        
-        if input_features_mask.shape != input_features.shape[:2]:
-            raise ValueError(
-                "input_features_mask must match input_features shape "
-                f"{input_features.shape[:2]}, got {input_features_mask.shape}"
-            )
-        
-        # Get audio embeddings from encoder + projector
-        audio_embeds = self.get_audio_features(input_features)
-        
+
         # Merge audio embeddings into token embeddings at audio token positions
         inputs_embeds = self.get_merged_audio_embeddings(
             input_ids=input_ids,

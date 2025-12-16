@@ -68,20 +68,22 @@ class TestConformerBlock:
         # Output should have same shape as input
         assert output.shape == x.shape, f"Expected {x.shape}, got {output.shape}"
 
-    def test_block_forward_no_nan(self, conformer_block):
+    def test_block_forward_no_nan(self, conformer_block, config):
         """Test that forward pass doesn't produce NaN values."""
         x = torch.randn(2, 50, 256)
-        attention_dists = torch.randint(0, 2001, (50, 50))
+        # attention_dists must have shape (context_size, context_size) for chunked attention
+        attention_dists = torch.randint(0, 2 * config.max_pos_emb + 1, (config.context_size, config.context_size))
 
         output = conformer_block(x, attention_dists)
 
         assert not torch.isnan(output).any(), "Output contains NaN values"
         assert not torch.isinf(output).any(), "Output contains Inf values"
 
-    def test_block_residual_connections(self, conformer_block):
+    def test_block_residual_connections(self, conformer_block, config):
         """Test that residual connections are working."""
         x = torch.randn(1, 10, 256)
-        attention_dists = torch.randint(0, 2001, (10, 10))
+        # attention_dists must have shape (context_size, context_size) for chunked attention
+        attention_dists = torch.randint(0, 2 * config.max_pos_emb + 1, (config.context_size, config.context_size))
 
         # If all submodules returned zeros, residuals should preserve input
         # This tests the architectural pattern
@@ -90,13 +92,14 @@ class TestConformerBlock:
         # Output should not be identical to input (due to processing)
         assert not torch.allclose(output, x), "Output should be different from input"
 
-    def test_block_batch_independence(self, conformer_block):
+    def test_block_batch_independence(self, conformer_block, config):
         """Test that samples in batch are processed independently."""
         # Set to eval mode to use running stats in BatchNorm (ensures batch independence)
         conformer_block.eval()
 
         x = torch.randn(4, 20, 256)
-        attention_dists = torch.randint(0, 2001, (20, 20))
+        # attention_dists must have shape (context_size, context_size) for chunked attention
+        attention_dists = torch.randint(0, 2 * config.max_pos_emb + 1, (config.context_size, config.context_size))
 
         # Process full batch
         output_batch = conformer_block(x, attention_dists)
@@ -363,6 +366,7 @@ class TestConformerComponents:
             num_heads=config.num_heads,
             dim_head=config.dim_head,
             max_pos_emb=config.max_pos_emb,
+            context_size=config.context_size,
             dropout=config.dropout,
         )
 
@@ -370,8 +374,8 @@ class TestConformerComponents:
 
         # Test forward pass
         x = torch.randn(2, 50, config.hidden_dim)
-        # Use config.max_pos_emb to generate valid attention distance indices
-        attention_dists = torch.randint(0, 2 * config.max_pos_emb + 1, (50, 50))
+        # attention_dists must have shape (context_size, context_size) for chunked attention
+        attention_dists = torch.randint(0, 2 * config.max_pos_emb + 1, (config.context_size, config.context_size))
         output = attn(x, attention_dists)
         assert output.shape == x.shape
 
@@ -680,7 +684,8 @@ class TestConformerRepresentations:
         # Forward through normalization and Q/K projection
         x_normed = attn_module.norm(x)
         q = attn_module.to_q(x_normed)
-        k = attn_module.to_k(x_normed)
+        # Implementation uses combined to_kv projection, split to get k and v
+        k, v = attn_module.to_kv(x_normed).chunk(2, dim=-1)
 
         # Reshape for multi-head
         batch, seq_len, _ = x.shape
