@@ -78,8 +78,12 @@ _default_decoder_config = GraniteConfig(
     rope_theta=10000000.0,
     pad_id=0,
     p_dropout=0.0,
-    tie_heads=False,
+    tie_heads=True,
     fused_weights=True,
+    residual_multiplier=0.22,
+    embedding_multiplier=12.0,
+    attention_multiplier=0.0078125,
+    logits_scaling=16.0,
 )
 
 
@@ -204,10 +208,11 @@ class GraniteSpeech(nn.Module):
         self.encoder._recompute_buffers()
 
         if self.config.decoder_config.tie_heads:
-            if self.lm_head.weight.device == torch.device("meta"):
-                self.lm_head.weight = self.decoder.embedding.weight
-            else:
-                self.decoder.embedding.weight = self.lm_head.weight
+            # Always tie lm_head to embedding, not the other way around.
+            # When loading from HF checkpoint with tie_word_embeddings=True,
+            # lm_head.weight is not in the checkpoint, so embedding has the
+            # correct weights and lm_head should point to it.
+            self.lm_head.weight = self.decoder.embedding.weight
 
     def get_input_embeddings(self):
         return self.decoder.embedding
@@ -399,8 +404,12 @@ _granite_speech_2b = GraniteSpeechConfig(
         rope_theta=10000000.0,
         pad_id=0,
         p_dropout=0.0,
-        tie_heads=False,
+        tie_heads=True,
         fused_weights=True,
+        residual_multiplier=0.22,
+        embedding_multiplier=12.0,
+        attention_multiplier=0.015625,
+        logits_scaling=8.0,
     ),
 )
 
