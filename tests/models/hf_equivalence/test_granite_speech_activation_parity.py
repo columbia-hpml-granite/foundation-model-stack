@@ -44,6 +44,19 @@ def _get_hf_model(model_path):
 
 def _get_fms_model(model_path):
     """Load FMS model using hf_pretrained."""
+    # FIXME: The ibm-granite/granite-speech-3.3-2b HuggingFace repo contains both
+    # old 3-shard checkpoint files (*-of-00003.safetensors, output_dim=42) and new
+    # 4-shard files (*-of-00004.safetensors, output_dim=256). FMS loads all safetensor
+    # files via glob instead of using model.safetensors.index.json, causing shape
+    # mismatches. Workaround: download with ignore_patterns to exclude old files.
+    if "granite-speech-3.3-2b" in model_path:
+        from huggingface_hub import snapshot_download
+
+        model_path = snapshot_download(
+            model_path,
+            ignore_patterns=["*-of-00003.safetensors"],
+        )
+
     model = get_model(
         "hf_pretrained",
         model_path,
