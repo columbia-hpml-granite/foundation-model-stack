@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ConformerConfig(ModelConfig):
+    """Configuration for Conformer encoder used in speech processing."""
     # Defaults match HF GraniteSpeechEncoderConfig
     num_features: int = 160  # 80 log-mel * 2 channels
     hidden_dim: int = 1024
@@ -31,7 +32,7 @@ class ConformerConfig(ModelConfig):
     feedforward_mult: int = 4
     dropout: float = 0.1
     max_pos_emb: int = 512
-    context_size: int = 200
+    context_size: int = 200  # Blocked attention context window
     output_dim: int = 256  # CTC vocabulary size
     use_ctc: bool = True
     activation: str = "silu"
@@ -39,6 +40,8 @@ class ConformerConfig(ModelConfig):
 
 
 class ConformerFeedForward(nn.Module):
+    """Macaron-style feedforward with pre-normalization (used before and after attention)."""
+
     def __init__(
         self,
         dim: int,
@@ -68,6 +71,8 @@ class ConformerFeedForward(nn.Module):
 
 
 class ConformerAttention(nn.Module):
+    """Multi-head self-attention with Shaw relative positional encoding and blocked computation."""
+
     def __init__(
         self,
         dim: int,
@@ -93,7 +98,7 @@ class ConformerAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_kv = nn.Linear(dim, self.inner_dim * 2, bias=False)
-        self.pos_emb = nn.Embedding(2 * max_pos_emb + 1, dim_head)
+        self.pos_emb = nn.Embedding(2 * max_pos_emb + 1, dim_head)  # Shaw relative positions
         self.to_out = nn.Linear(self.inner_dim, dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -142,6 +147,8 @@ class ConformerAttention(nn.Module):
 
 
 class ConformerConvModule(nn.Module):
+    """Depthwise-separable convolution module with GLU activation."""
+
     def __init__(
         self,
         dim: int,
@@ -157,7 +164,7 @@ class ConformerConvModule(nn.Module):
         self.dropout = dropout
 
         self.norm = nn.LayerNorm(dim)
-        self.pointwise_conv1 = nn.Conv1d(dim, dim * expansion_factor * 2, kernel_size=1)
+        self.pointwise_conv1 = nn.Conv1d(dim, dim * expansion_factor * 2, kernel_size=1)  # 2x for GLU
         self.depthwise_conv = nn.Conv1d(
             dim * expansion_factor,
             dim * expansion_factor,
@@ -190,10 +197,13 @@ class ConformerConvModule(nn.Module):
 
 
 class ConformerBlock(nn.Module):
+    """Conformer block with Macaron-style half-step feedforward residuals."""
+
     def __init__(self, config: ConformerConfig):
         super().__init__()
         self.config = config
 
+        # Macaron-style: FF before and after attention
         self.ff1 = ConformerFeedForward(
             dim=config.hidden_dim,
             mult=config.feedforward_mult,
@@ -238,6 +248,8 @@ class ConformerBlock(nn.Module):
 
 
 class ConformerEncoder(nn.Module):
+    """Conformer encoder for acoustic feature extraction from mel-spectrograms."""
+
     def __init__(
         self,
         config: Optional[ConformerConfig] = None,
@@ -257,6 +269,7 @@ class ConformerEncoder(nn.Module):
             ConformerBlock(self.config) for _ in range(self.config.num_layers)
         ])
 
+        # Optional CTC (Connectionist Temporal Classification) auxiliary loss
         if self.config.use_ctc:
             self.out = nn.Linear(self.config.hidden_dim, self.config.output_dim)
             self.out_mid = nn.Linear(self.config.output_dim, self.config.hidden_dim)
@@ -300,7 +313,7 @@ class ConformerEncoder(nn.Module):
         x = self.input_proj(input_features)
         attention_dists = self.attention_dists
 
-        # Mid-layer CTC feedback
+        # Intermediate CTC feedback: inject softmax predictions at mid-layer for auxiliary loss
         mid_layer = len(self.blocks) // 2
         for idx, block in enumerate(self.blocks, start=1):
             x = block(x, attention_dists)

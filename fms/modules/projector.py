@@ -17,16 +17,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpeechProjectorConfig(ModelConfig):
-    encoder_dim: int = 1024
+    """Configuration for Q-Former projector that bridges encoder and decoder dimensions."""
+    encoder_dim: int = 1024  # Conformer encoder output dimension
     encoder_hidden_size: Optional[int] = None
-    decoder_dim: int = 2048
+    decoder_dim: int = 2048  # Target language model dimension
     window_size: int = 15
     downsample_rate: int = 5
     num_queries: int = 3
     num_hidden_layers: int = 2
     num_attention_heads: int = 16
     intermediate_size: int = 4096
-    cross_attention_frequency: int = 1
+    cross_attention_frequency: int = 1  # Apply cross-attention every N layers
     hidden_dropout_prob: float = 0.1
     attention_dropout_prob: float = 0.1
     hidden_act: str = "gelu"
@@ -35,6 +36,8 @@ class SpeechProjectorConfig(ModelConfig):
 
 
 class QFormerSelfAttention(nn.Module):
+    """Self-attention layer for query tokens to communicate with each other."""
+
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         assert config.encoder_dim % config.num_attention_heads == 0
@@ -79,6 +82,8 @@ class QFormerSelfAttention(nn.Module):
 
 
 class QFormerCrossAttention(nn.Module):
+    """Cross-attention layer where queries attend to encoder outputs."""
+
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         assert config.encoder_dim % config.num_attention_heads == 0
@@ -126,6 +131,8 @@ class QFormerCrossAttention(nn.Module):
 
 
 class QFormerAttentionOutput(nn.Module):
+    """Attention output projection with residual connection and layer norm."""
+
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         self.dense = nn.Linear(config.encoder_dim, config.encoder_dim)
@@ -140,6 +147,8 @@ class QFormerAttentionOutput(nn.Module):
 
 
 class QFormerIntermediate(nn.Module):
+    """Feedforward intermediate layer with activation."""
+
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         self.dense = nn.Linear(config.encoder_dim, config.intermediate_size)
@@ -152,6 +161,8 @@ class QFormerIntermediate(nn.Module):
 
 
 class QFormerOutput(nn.Module):
+    """Feedforward output layer with residual connection and layer norm."""
+
     def __init__(self, config: SpeechProjectorConfig):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.encoder_dim)
@@ -166,6 +177,8 @@ class QFormerOutput(nn.Module):
 
 
 class QFormerLayer(nn.Module):
+    """Q-Former layer with self-attention, optional cross-attention, and feedforward."""
+
     def __init__(self, config: SpeechProjectorConfig, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
@@ -173,6 +186,7 @@ class QFormerLayer(nn.Module):
         self.self_attention = QFormerSelfAttention(config)
         self.self_attention_output = QFormerAttentionOutput(config)
 
+        # Apply cross-attention every N layers (default: every layer)
         if layer_idx % config.cross_attention_frequency == 0:
             self.cross_attention = QFormerCrossAttention(config)
             self.cross_attention_output = QFormerAttentionOutput(config)
@@ -211,6 +225,8 @@ class QFormerLayer(nn.Module):
 
 
 class SpeechProjector(nn.Module):
+    """Projects acoustic features to language model dimension using Q-Former architecture."""
+
     def __init__(
         self,
         config: SpeechProjectorConfig,
@@ -231,6 +247,7 @@ class SpeechProjector(nn.Module):
         if self.num_queries is None:
             self.num_queries = self.window_size // self.downsample_rate
 
+        # Learnable query tokens that aggregate encoder outputs via cross-attention
         self.query_embeds = nn.Parameter(torch.zeros(1, self.num_queries, config.encoder_dim))
         nn.init.normal_(self.query_embeds, mean=0.0, std=1.0)
 
@@ -264,6 +281,7 @@ class SpeechProjector(nn.Module):
         batch_size, seq_len, dim = encoder_hidden_states.shape
         device = encoder_hidden_states.device
 
+        # Partition encoder outputs into fixed-size windows for efficient processing
         nblocks = math.ceil(seq_len / self.window_size)
         pad = nblocks * self.window_size - seq_len
         if pad > 0:
@@ -285,5 +303,6 @@ class SpeechProjector(nn.Module):
 
         query_states = query_states.view(batch_size, nblocks * self.num_queries, -1)
 
+        # Project from encoder dimension to decoder dimension for language model input
         projected_states = self.output_proj(query_states)
         return projected_states
