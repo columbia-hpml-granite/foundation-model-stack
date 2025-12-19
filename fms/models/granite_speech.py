@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from fms import models
 from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
 from fms.models.conformer import ConformerConfig, ConformerEncoder
-from fms.models.granite import Granite, GraniteConfig, GraniteHeadless
+from fms.models.granite import GraniteConfig, GraniteHeadless
 from fms.modules.projector import SpeechProjector, SpeechProjectorConfig
 from fms.utils.config import ModelConfig
 
@@ -89,19 +89,22 @@ _default_decoder_config = GraniteConfig(
 
 @dataclass
 class GraniteSpeechConfig(ModelConfig):
+    """Configuration for Granite Speech multimodal model (Conformer encoder + Granite decoder)."""
     encoder_config: ConformerConfig = field(default_factory=lambda: _default_encoder_config)
     projector_config: SpeechProjectorConfig = field(default_factory=lambda: _default_projector_config)
     decoder_config: GraniteConfig = field(default_factory=lambda: _default_decoder_config)
-    audio_token_index: int = 49159
+    audio_token_index: int = 49159  # Token ID used as placeholder for audio embeddings
     has_lora_adapter: bool = True
-    downsample_rate: int = 5
-    window_size: int = 15
+    downsample_rate: int = 5  # Temporal downsampling factor in projector
+    window_size: int = 15  # Context window size for Q-Former projector
     initializer_range: float = 0.02
     freeze_encoder: bool = False
     freeze_decoder: bool = False
 
 
 class GraniteSpeech(nn.Module):
+    """Multimodal speech-to-text model combining Conformer encoder with Granite decoder."""
+
     def __init__(
         self,
         config: Optional[GraniteSpeechConfig] = None,
@@ -123,6 +126,7 @@ class GraniteSpeech(nn.Module):
         self.window_size = self.config.window_size
         self.downsample_rate = self.config.downsample_rate
 
+        # Encoder-projector-decoder pipeline for speech-to-text
         self.encoder = ConformerEncoder(self.config.encoder_config)
         self.projector = SpeechProjector(
             self.config.projector_config,
@@ -136,6 +140,7 @@ class GraniteSpeech(nn.Module):
             bias=False,
         )
 
+        # Freeze encoder/decoder if specified (for finetuning)
         if self.config.freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -146,6 +151,7 @@ class GraniteSpeech(nn.Module):
             for param in self.lm_head.parameters():
                 param.requires_grad = False
 
+        # NOTE: LoRA adapters only applied to decoder attention layers
         if self.config.has_lora_adapter and not is_peft_available():
             logger.warning(
                 "Config indicates that a lora adapter should be present, but "
@@ -232,6 +238,7 @@ class GraniteSpeech(nn.Module):
         audio_features: torch.Tensor,
         input_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Replace audio token placeholders with actual audio embeddings
         audio_pos = (input_ids == self.audio_token_index)
         safe_ids = torch.where(audio_pos, input_ids.new_zeros(()), input_ids)
         token_embeds = self.get_input_embeddings()(safe_ids)
@@ -246,6 +253,7 @@ class GraniteSpeech(nn.Module):
             )
         audio_flat = audio_features[audio_mask]
 
+        # Verify audio token count matches provided audio embeddings
         expected = audio_pos.sum().item()
         if expected * token_embeds.size(-1) != audio_flat.numel():
             raise ValueError(
@@ -253,6 +261,7 @@ class GraniteSpeech(nn.Module):
                 f"{audio_flat.shape[0]} audio vectors provided."
             )
 
+        # Scatter audio embeddings into token positions
         mask = audio_pos.unsqueeze(-1)
         merged = token_embeds.masked_scatter(mask, audio_flat)
 
@@ -291,6 +300,7 @@ class GraniteSpeech(nn.Module):
         if inputs_embeds is None:
             has_audio_token = input_ids is not None and (input_ids == self.audio_token_index).any()
 
+            # Process audio+text multimodal input
             if input_features is not None and has_audio_token:
                 if input_ids is None:
                     raise ValueError("input_ids are required when using input_features.")
@@ -310,6 +320,7 @@ class GraniteSpeech(nn.Module):
                     input_features_mask=input_features_mask,
                 )
             else:
+                # Text-only input
                 inputs_embeds = self.get_input_embeddings()(input_ids)
 
         dec_out, cache = self.decoder(
@@ -346,6 +357,7 @@ class GraniteSpeech(nn.Module):
         input_ids: torch.Tensor,
         kwargs: dict,
     ) -> Tuple[torch.Tensor, dict]:
+        # After first iteration, use cached key-values and skip embedding computation
         if kwargs.get("use_cache", False) and iteration > 0:
             kwargs.pop("inputs_embeds", None)
             return input_ids, kwargs
@@ -353,6 +365,7 @@ class GraniteSpeech(nn.Module):
         input_features = kwargs.pop("input_features", None)
         input_features_mask = kwargs.pop("input_features_mask", None)
 
+        # Enable LoRA adapters only when processing audio inputs
         if iteration == 0:
             self._maybe_toggle_adapters(input_features)
 
@@ -427,6 +440,7 @@ models.register_model(
 def _merge_lora_weights(
     input_sd: Mapping[str, Any], **kwargs
 ) -> Mapping[str, Any]:
+    """Merges LoRA adapter weights into base model weights for deployment."""
     new_sd = {}
     lora_keys_processed = set()
     lora_scaling = 0.5
@@ -480,6 +494,7 @@ def _merge_lora_weights(
 def _hf_to_fms_names(
     input_sd: Mapping[str, Any], **kwargs
 ) -> Mapping[str, Any]:
+    """Converts HuggingFace checkpoint keys to FMS naming convention."""
     encoder_replacements = [
         (r"^encoder\.input_linear", "encoder.input_proj"),
         (r"^encoder\.layers\.(\d+)", r"encoder.blocks.\1"),
@@ -556,6 +571,7 @@ def _granite_speech_weight_fusion(
     model_config: Optional[GraniteSpeechConfig] = None,
     **kwargs
 ) -> Mapping[str, Any]:
+    """Fuses attention and MLP weights for improved inference efficiency."""
     from fms.utils import serialization
 
     decoder_sd = {k: v for k, v in input_sd.items()
@@ -581,6 +597,7 @@ def _granite_speech_weight_fusion(
 def _hf_to_fms_rope(
     input_sd: Mapping[str, Any], model_config: Optional[GraniteSpeechConfig] = None, **kwargs
 ) -> Mapping[str, Any]:
+    """Applies RoPE (Rotary Position Embedding) weight transformations for query/key projections."""
     new_sd = {}
 
     if model_config:
@@ -595,6 +612,7 @@ def _hf_to_fms_rope(
 
     for name, param in input_sd.items():
         if rope_pattern.match(name) and param.numel() > 1:
+            # Interleave RoPE dimensions: (h, d/2, 2) -> (h, 2, d/2)
             temp = param
             num_heads = temp.size(0) // head_size
 
@@ -646,13 +664,15 @@ except ImportError:
 
 
 class GraniteSpeechFeatureExtractor:
+    """Extracts mel-spectrogram features from raw audio for speech processing."""
+
     def __init__(
         self,
         sampling_rate: int = 16000,
         n_fft: int = 512,
         win_length: int = 400,
         hop_length: int = 160,
-        n_mels: int = 80,
+        n_mels: int = 80,  # Number of mel filterbanks
         projector_window_size: int = 15,
         projector_downsample_rate: int = 5,
         **kwargs,
@@ -717,14 +737,17 @@ class GraniteSpeechFeatureExtractor:
         bsz = audio.shape[0]
 
         with torch.no_grad():
+            # Compute mel-spectrogram and apply log normalization
             mel = melspec(audio.float())
             logmel = mel.transpose(-1, -2).clip_(min=1e-10).log10_()
             mx = logmel.amax(dim=(-2, -1), keepdim=True)
             logmel = torch.maximum(logmel, mx - 8.0).div_(4).add_(1)
 
+            # Ensure even length for pairwise stacking
             if logmel.shape[1] % 2 == 1:
                 logmel = logmel[:, :-1]
 
+            # Stack adjacent frames to create 2-channel features
             audio_features = logmel.reshape(bsz, -1, 2 * logmel.shape[-1])
 
         return audio_features
@@ -778,6 +801,8 @@ class GraniteSpeechFeatureExtractor:
 
 
 class GraniteSpeechProcessor:
+    """Combines audio feature extraction with text tokenization for multimodal inputs."""
+
     def __init__(
         self,
         audio_processor: GraniteSpeechFeatureExtractor,
@@ -822,11 +847,13 @@ class GraniteSpeechProcessor:
         text: list[str],
         audio_embed_sizes: Sequence[int]
     ) -> list[str]:
+        # Expand single audio token to multiple tokens matching projected feature count
         prompt_strings = []
         num_replaced = 0
 
         for sample in text:
             while self.audio_token in sample:
+                # Replace each audio token with N placeholders (N = projected feature count)
                 sample = sample.replace(
                     self.audio_token,
                     "<placeholder>" * audio_embed_sizes[num_replaced],
@@ -835,6 +862,7 @@ class GraniteSpeechProcessor:
                 num_replaced += 1
             prompt_strings.append(sample)
 
+        # Convert placeholders back to audio tokens for tokenization
         prompt_strings = [s.replace("<placeholder>", self.audio_token) for s in prompt_strings]
 
         return prompt_strings
